@@ -1,0 +1,39 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+coverage.xml
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local Python environments and credentials
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+/factorops/env
+
+# Local Jupyter state. Keep intentional notebooks tracked explicitly.
+.ipynb_checkpoints/
+
+# Editor and operating-system metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local investigation notebook; do not version control.
+/sqlserver取数精度问题说明.ipynb

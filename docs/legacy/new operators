@@ -1,0 +1,435 @@
+"""
+信号复现：当前状况与解决方案
+===========================
+
+## 当前状况
+
+在 review_comparison 测试中，22 个信号里有 4 个高频信号的公式计算结果与 SQL 参考
+实现严重不匹配：
+
+| 信号            | corr (相关系数) | 根因                                       |
+|-----------------|------------------|--------------------------------------------|
+| HfReturnKurt    | -0.04            | 原公式是「负日内对数收益 20 日均值」，与峰度无关  |
+| HfReturnSkew    |  0.39            | 同上，与偏度无关                            |
+| PATV            |  0.05            | 原公式只是 5 分钟换手量日内求和，缺少横截面排名    |
+| MaxUp           |  NaN (freq_mix)  | 跨频率问题，需要进一步讨论                    |
+
+## 为什么会出现占位公式？
+
+编写这些信号时，因子算子框架里**不存在**：
+  - 计算日内峰度 / 偏度的算子（需要沿 step 轴计算三阶/四阶矩）
+  - 横截面排名算子（需要在同一时间切片中按股票轴排序）
+
+所以当时写了一个**能编译、能出数值**的公式作为占位——但语义上完全不是目标因子。
+证据：HfReturnKurt 和 HfReturnSkew 用的是**完全相同的公式**（只是别名不同）：
+
+    ln(step_last(close_price_today / close_price_yesterday))
+    → 20日滚动均值 → 取负
+
+这是「过去 20 天收盘对数收益均值的负值」，与峰度、偏度毫无关系。
+
+## SQL 参考实现 vs 占位公式
+
+### HfReturnKurt — 日内超额峰度（4 阶矩）
+
+**SQL 参考（正确实现）**，计算每天的超额峰度：
+
+    SELECT trading_day, InnerCode,
+        -- 校正系数 N*(N+1)*(N-1) / ((N-2)*(N-3))
+        avg((N*(N+1)*(N-1)) / ((N-2)*(N-3))) * sum(log_return_demean**4)
+            / sum(log_return_demean**2)**2
+        -- 减去偏置项 3*(N-1)^2 / ((N-2)*(N-3))
+        - avg((3*(N-1)**2) / ((N-2)*(N-3))) AS kurt_d
+    FROM (
+        SELECT *,
+            log_return - avg(log_return) OVER(PARTITION BY trading_day, InnerCode) AS log_return_demean,
+            count(*) OVER(PARTITION BY trading_day, InnerCode) AS N
+        FROM data_log_return
+    )
+    GROUP BY trading_day, InnerCode
+
+然后再对最近 20 个交易日的 kurt_d 取平均并取负。
+
+**当前算子公式（占位）**：
+
+    neg(ts_mean(
+        ln(step_last(stk.5min.close_price / delay(stk.5min.close_price, periods=1, axis=0))),
+        window=20
+    ))
+
+→ 完全是另一个统计量。
+
+### HfReturnSkew — 日内偏度（3 阶矩）
+
+**SQL 参考（正确实现）**：
+
+    sum((N * sqrt(N-1) / (N-2)) * (log_return_demean ** 3)) / sum(log_return_demean ** 2) ** 1.5
+
+**当前算子公式**：与 HfReturnKurt 相同（占位）。
+
+### PATV — 异常交易量的横截面百分位排名
+
+**SQL 参考（正确实现）**：
+
+    prev_3d_mean = 过去 3 个交易日每日换手量的均值（按股票）
+    atv          = 当天每根 5 分钟 K 线的换手量 / prev_3d_mean   # 异常换手量
+    atv_rank     = 在**该时间切片的横截面上**计算 atv 的百分位排名（pct=True）
+    输出         = -( mean(atv_rank)/std(atv_rank) + kurt(atv_rank) )    # 按股票聚合
+
+→ 关键操作：「在同一 5 分钟切片内，对 ~5000 只股票的 atv 做 rank(pct=True)」
+→ 这正是 cs_rank(x, pct=True) 要做的事。
+
+## 用新算子后公式会变成什么样（示例）
+
+### HfReturnKurt（忠实实现）
+
+    # 1. 取 1min 收盘价并显式聚合为 5min
+    close_5m = resample(
+        get_hf("stk", "1min", "close_price"),
+        "5min",
+        method="last",
+    )
+
+    # 2. 算日内对数收益（每根 5min bar 与上一根 bar 相比）
+    FeatureDef.from_key(
+        "stk.5min.log_return_5m",
+        formula="ln(divide(stk.5min.close_5m, step_delay(stk.5min.close_5m, periods=1)))",
+        materialize=False
+    )
+
+    # 3. 沿日内 step 轴算超额峰度（新算子），每个 (date, stock) → 1 个标量
+    FeatureDef.from_key(
+        "stk.1d.intraday_excess_kurtosis",
+        formula="step_kurtosis(stk.5min.log_return_5m)",
+        materialize=False
+    )
+
+    # 4. 20 日滚动均值，取负
+    _formula_from_key(
+        output_key,
+        formula="neg(ts_mean(stk.1d.intraday_excess_kurtosis, window=20, min_periods=1))",
+        materialize=True
+    )
+
+### HfReturnSkew（忠实实现）
+
+结构完全相同，把 step_kurtosis 换成 step_skewness 即可。
+
+### PATV（忠实实现）——需要更多细节
+
+    turnover_vol_today   = resample(
+        get_hf("stk", "1min", "turnover_volume"),
+        "5min",
+        method="sum",
+    )
+    prev_mean_turnover   = ts_mean(turnover_vol_prev_days, window=3)    # 过去 3 日均值
+    atv                  = turnover_vol_today / prev_mean_turnover       # 异常换手
+    atv_rank             = cs_rank(atv, pct=True)                        # 横截面百分位排名（新算子）
+
+    # 按股票聚合：mean/std + kurt（后两者可复用 step_kurtosis 或单独做）
+    output = neg(step_mean(atv_rank) / step_std(atv_rank) + step_kurtosis(atv_rank))
+
+## 待实现的新算子（见下方）
+
+| 算子                  | 功能                                     | 解锁的信号      |
+|-----------------------|------------------------------------------|-----------------|
+| step_skewness(x)      | 沿 step 轴算日内偏度（3 阶矩）             | HfReturnSkew    |
+| step_kurtosis(x)      | 沿 step 轴算日内超额峰度（4 阶矩，N 校正） | HfReturnKurt    |
+| cs_rank(x, pct=True)  | 沿股票轴做横截面百分位排名                 | PATV            |
+
+每个算子：
+  - 输出形状与现有 step_mean / step_sum 相同（(n_dates, n_assets, 1)）
+  - 内置 NaN 处理，能优雅应对日内缺失 K 线
+  - docstring 里标注了与 SQL 参考实现的精确对应关系
+  - 文件末尾附带可直接运行的单元测试（`python proposed_new_operators.py`）
+
+## 接入步骤
+
+1. 把 3 个新函数拷贝到 factor-operators/core/ops.py
+2. 在 ops.py 的 default_operator_registry() 里注册：
+       "step_skewness": step_skewness,
+       "step_kurtosis": step_kurtosis,
+       "cs_rank": cs_rank,
+3. 在 engine.py 的 DAILY_FROM_INTRADAY_OPS 里加入 "step_skewness"、"step_kurtosis"
+   （让 Planner 在将 1min/5min 改写为 1d 目标公式时保留高频叶子）
+4. 把 signal_registry.py 里的占位公式替换成上面给出的忠实实现
+
+=======================================================================
+1. STEP REDUCING OPERATORS
+=======================================================================
+
+These reduce the *step* axis (e.g., all 5-minute bars within a single day)
+into a single scalar per (date, stock). They return arrays with shape
+(n_dates, n_assets, 1).
+
+They follow the same convention as existing ops (step_mean, step_sum, etc.)
+and use np.nan-prefixed reductions to handle missing intraday bars gracefully.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from scipy.stats import rankdata
+
+try:
+    from .ops import ensure_3d, OperatorSpec
+except ImportError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent / "factor-operators" / "core"))
+    from ops import ensure_3d, OperatorSpec
+
+
+# ---------------------------------------------------------------------
+# step_skewness(x) — sample skewness along the step axis
+#
+# Uses the Fisher (bias-corrected) definition:
+#   skew = [ n / ((n-1)(n-2)) ] * sum( ((x - mean) / std)^3 )
+#
+# Minimum 3 non-NaN bars required per (date, stock); otherwise NaN.
+# ---------------------------------------------------------------------
+def step_skewness(x):
+    """Sample skewness along the step axis (3rd moment).
+
+    Matches the SQL reference used by HfReturnSkew standalone (core.py):
+
+        sum( N * sqrt(N-1) / (N-2) * r_demean^3 ) / sum( r_demean^2 )^1.5
+    """
+    arr = ensure_3d(x).astype(float)
+    mean = np.nanmean(arr, axis=2, keepdims=True)
+    demeaned = arr - mean
+    n = np.sum(~np.isnan(arr), axis=2, keepdims=True)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        coef = n * np.sqrt(n - 1) / (n - 2)
+        m3 = np.nansum(demeaned ** 3, axis=2, keepdims=True)
+        m2 = np.nansum(demeaned ** 2, axis=2, keepdims=True)
+        skew = coef * m3 / (m2 ** 1.5)
+    skew = np.where(n >= 3, skew, np.nan)
+    return skew
+
+
+# ---------------------------------------------------------------------
+# step_kurtosis(x) — excess kurtosis along the step axis (4th moment,
+# N-bias-corrected).
+#
+# This matches the exact formula used by the SQL reference
+# (Signal_HfReturnKurt/core.py):
+#
+#   kurt_d =
+#       avg( N*(N+1)*(N-1) / ((N-2)*(N-3)) )
+#         * sum( r_demean^4 ) / sum( r_demean^2 )^2
+#       - avg( 3*(N-1)^2 / ((N-2)*(N-3)) )
+#
+# which simplifies to the standard excess-kurtosis estimator:
+#
+#   kurt_excess = [ n*(n+1) / ((n-1)*(n-2)*(n-3)) ] * sum(d^4) / var^2
+#                 - 3*(n-1)^2 / ((n-2)*(n-3))
+#
+# Minimum 4 non-NaN bars required; otherwise NaN.
+# ---------------------------------------------------------------------
+def step_kurtosis(x):
+    """Excess kurtosis along the step axis (4th moment, N-bias corrected).
+
+    Matches the SQL reference for HfReturnKurt exactly (see standalone
+    core.py).
+    """
+    arr = ensure_3d(x).astype(float)
+    mean = np.nanmean(arr, axis=2, keepdims=True)
+    demeaned = arr - mean
+    n = np.sum(~np.isnan(arr), axis=2, keepdims=True)
+
+    m4 = np.nansum(demeaned ** 4, axis=2, keepdims=True)
+    m2 = np.nansum(demeaned ** 2, axis=2, keepdims=True)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        coef1 = (n * (n + 1) * (n - 1)) / ((n - 2) * (n - 3))
+        coef2 = (3 * (n - 1) ** 2) / ((n - 2) * (n - 3))
+        kurt = coef1 * m4 / (m2 ** 2) - coef2
+    kurt = np.where(n >= 4, kurt, np.nan)
+    return kurt
+
+
+# ---------------------------------------------------------------------
+# Register as step-reducing operators in engine.py's DAILY_FROM_INTRADAY_OPS:
+#
+#   DAILY_FROM_INTRADAY_OPS = {
+#       ...
+#       "step_skewness",
+#       "step_kurtosis",
+#   }
+#
+# so that the Planner recognizes these as intraday→daily reducers and
+# preserves the 1min/5min leaf features when rewriting into a 1d target
+# formula.
+# ---------------------------------------------------------------------
+
+
+# =======================================================================
+# 2. CROSS-SECTIONAL OPERATOR
+# =======================================================================
+
+# cs_rank(x, pct=False, method='ordinal')
+#
+# Ranks stocks along the *asset* axis at each (date, step).
+# Default returns integer ranks; pct=True returns percentile ranks in [0, 1]
+# (matching pandas .rank(pct=True)).
+#
+# This matches what the standalone PATV core does:
+#     data.groupby("start_time").apply(lambda df: df["atv"].rank(method="dense", pct=True))
+#
+# i.e., rank the cross-sectional distribution of abnormal turnover volume
+# *within* each intraday bar.
+# ---------------------------------------------------------------------
+_CS_RANK_METHODS = {"ordinal", "min", "max", "dense"}
+
+
+def cs_rank(x, pct=False, method: str = "ordinal"):
+    """Cross-sectional rank along the asset axis.
+
+    Parameters
+    ----------
+    x : array-like, shape (n_dates, n_assets, n_steps)
+    pct : bool
+        If True, divide ranks by the number of non-NaN assets in that
+        slice, yielding a percentile rank in [0, 1].
+    method : {"ordinal", "min", "max", "dense"}
+        Tie-handling method; see `scipy.stats.rankdata`.
+    """
+    if method not in _CS_RANK_METHODS:
+        raise ValueError(f"cs_rank method must be one of {_CS_RANK_METHODS}, got {method!r}")
+
+    arr = ensure_3d(x).astype(float)
+    n_dates, n_assets, n_steps = arr.shape
+    out = np.full_like(arr, np.nan)
+
+    for t in range(n_dates):
+        for s in range(n_steps):
+            col = arr[t, :, s]
+            valid = ~np.isnan(col)
+            n_valid = valid.sum()
+            if n_valid == 0:
+                continue
+            ranks = rankdata(col[valid], method=method)
+            if pct:
+                ranks = ranks / n_valid
+            out[t, valid, s] = ranks
+
+    return out
+
+
+# ---------------------------------------------------------------------
+# Registration in default_operator_registry():
+#
+#     "step_skewness": step_skewness,
+#     "step_kurtosis": step_kurtosis,
+#     "cs_rank": cs_rank,
+#
+# cs_rank does not need the special output_asset/output_step treatment
+# that lookup_by_col or broadcast_to_steps have — it just returns an
+# array of the same shape as input (with ranks in the asset axis).
+# ---------------------------------------------------------------------
+
+
+# =======================================================================
+# SIGNAL USAGE EXAMPLES
+# =======================================================================
+#
+# Once registered, these operators enable faithful translations of the
+# standalone signals:
+#
+# --- Signal_HfReturnKurt ---
+#
+#     resample(get_hf("stk", "1min", "close_price"), "5min", method="last")
+#     → stk.5min.minute_log_return_5m  (per-bar log returns)
+#     → step_kurtosis(stk.1d.minute_log_return_5m)   # 1 scalar per day
+#     → neg(ts_mean(..., window=20))                 # 20d rolling mean
+#
+# --- Signal_HfReturnSkew ---
+#
+#     ... same pattern but uses step_skewness(...) ...
+#
+# --- Signal_PATV ---
+#
+#     turnover_atv = turnover_vol_today / mean(turnover_vol_prev_N_days)
+#     atv_rank     = cs_rank(turnover_atv, pct=True)   # rank within each bar
+#     → mean(atv_rank) / std(atv_rank) + kurt(atv_rank)
+#     → take the negative
+#
+# Note: PATV's final step ("mean/std + kurt over bars") is itself a
+# kurtosis-like reduction. It could be expressed using step_mean /
+# step_std / step_kurtosis once the intraday kurtosis operator is in
+# place, OR by introducing a dedicated per-stock aggregation op.
+# =======================================================================
+
+
+# =======================================================================
+# UNIT TESTS
+# =======================================================================
+# Quick sanity checks — run with `python proposed_new_operators.py`:
+
+if __name__ == "__main__":
+    np.random.seed(0)
+
+    # -- shape test --
+    arr = np.random.randn(2, 5, 10)  # 2 days, 5 stocks, 10 bars
+    sk = step_skewness(arr)
+    ku = step_kurtosis(arr)
+    assert sk.shape == (2, 5, 1), f"step_skewness shape wrong: {sk.shape}"
+    assert ku.shape == (2, 5, 1), f"step_kurtosis shape wrong: {ku.shape}"
+
+    # -- value test (1 stock, 1 day) vs the SQL reference formula --
+    single = arr[0, 0, :]
+    n = len(single)
+    mean = single.mean()
+    demeaned = single - mean
+    m3 = (demeaned ** 3).sum()
+    m2 = (demeaned ** 2).sum()
+    m4 = (demeaned ** 4).sum()
+
+    # HfReturnSkew SQL formula:
+    expected_sk = (n * np.sqrt(n - 1) / (n - 2)) * m3 / (m2 ** 1.5)
+    # HfReturnKurt SQL formula:
+    c1 = n * (n + 1) * (n - 1) / ((n - 2) * (n - 3))
+    c2 = 3 * (n - 1) ** 2 / ((n - 2) * (n - 3))
+    expected_ku = c1 * m4 / (m2 ** 2) - c2
+
+    got_sk = float(sk[0, 0, 0])
+    got_ku = float(ku[0, 0, 0])
+    assert abs(got_sk - expected_sk) < 1e-10, f"skewness {got_sk} != {expected_sk}"
+    assert abs(got_ku - expected_ku) < 1e-10, f"kurtosis {got_ku} != {expected_ku}"
+
+    # -- NaN bar handling --
+    arr_nan = arr.copy()
+    arr_nan[0, 0, 3:7] = np.nan  # mask out 4 bars → 6 left
+    sk_nan = step_skewness(arr_nan)
+    assert not np.isnan(sk_nan[0, 0, 0]), "skewness should handle partial NaN"
+    arr_too_few = arr.copy()
+    arr_too_few[0, 0, 2:] = np.nan  # only 2 bars → should be NaN
+    sk_few = step_skewness(arr_too_few)
+    assert np.isnan(sk_few[0, 0, 0]), "skewness with <3 bars should be NaN"
+
+    # -- cs_rank test --
+    # 1 date, 5 stocks, 1 bar
+    rank_in = np.array([[[3.0], [1.0], [4.0], [2.0], [5.0]]]).reshape(1, 5, 1)
+    r = cs_rank(rank_in)
+    assert r.shape == (1, 5, 1)
+    assert np.array_equal(r[0, :, 0], [3.0, 1.0, 4.0, 2.0, 5.0]), \
+        f"ordinal ranks wrong: {r[0, :, 0]}"
+    rp = cs_rank(rank_in, pct=True)
+    assert np.allclose(rp[0, :, 0], [0.6, 0.2, 0.8, 0.4, 1.0]), \
+        f"percentile ranks wrong: {rp[0, :, 0]}"
+
+    # -- cs_rank with NaN --
+    rank_nan = rank_in.copy()
+    rank_nan[0, 2, 0] = np.nan
+    rn = cs_rank(rank_nan, pct=True)
+    # 4 valid stocks → percentile ranks ∈ {0.25, 0.5, 0.75, 1.0}
+    assert np.isnan(rn[0, 2, 0]), "NaN position should stay NaN"
+    rn_valid = rn[0, np.array([True, True, False, True, True]), 0]
+    assert np.allclose(np.sort(rn_valid), [0.25, 0.5, 0.75, 1.0]), \
+        f"NaN pct rank wrong: {rn[0, :, 0]}"
+
+    print("All tests passed.")
+    print(f"  step_skewness[0,0,0]: {got_sk:.6f} (expected SQL formula: {expected_sk:.6f})")
+    print(f"  step_kurtosis[0,0,0]: {got_ku:.6f} (expected SQL formula: {expected_ku:.6f})")

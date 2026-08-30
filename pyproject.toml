@@ -1,0 +1,37 @@
+[project]
+name = "factor-engine"
+version = "0.1.0"
+description = "Snapshot-based factor definition, alignment, and materialization engine."
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "bottleneck>=1.6.0",
+    "connectorx>=0.4.5",
+    "duckdb>=1.5.4",
+    "numba>=0.66.0",
+    "numpy>=2.4.6",
+    "pandas>=3.0.3",
+    "pyarrow>=25.0.0",
+    "python-dotenv>=1.2.2",
+]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"factor_engine.data_provider" = ["data_sources.json"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "ipywidgets>=8.1.8",
+    "pytest>=9.1.1",
+    "ruff>=0.15.22",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

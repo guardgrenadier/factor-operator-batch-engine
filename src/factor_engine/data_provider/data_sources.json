@@ -1,0 +1,144 @@
+{
+  "schema_version": 2,
+  "source_tables": [
+    {
+      "asset": "stk",
+      "freq": "1d",
+      "source": "ReturnDaily",
+      "table": "SmartQuant.ReturnDaily",
+      "asset_axis": true,
+      "date_col": "DataDate",
+      "trading_flag_col": "IfTradingDay"
+    },
+    {
+      "asset": "cb",
+      "freq": "1d",
+      "source": "CBReturnDaily",
+      "table": "SmartQuant.CBReturnDaily",
+      "asset_axis": true,
+      "date_col": "DataDate",
+      "trading_flag_col": "IfTradingDay"
+    },
+    {
+      "asset": "idx",
+      "freq": "1d",
+      "source": "IndexQuote",
+      "table": "JYDB.QT_IndexQuote",
+      "asset_axis": true,
+      "date_col": "TradingDay"
+    },
+    {
+      "asset": "stk",
+      "freq": "1min",
+      "source": "MinuteParquet",
+      "table": "/data/cephfs/minute/one_minute_stat/{date}.parquet",
+      "data_type": "one_minute_stat",
+      "path_template": "/data/cephfs/minute/one_minute_stat/{date}.parquet",
+      "sample_date": "2024-12-31",
+      "date_col": "trading_day",
+      "date_col_type": "date"
+    },
+    {
+      "asset": "cb",
+      "freq": "1min",
+      "source": "MinuteParquet",
+      "table": "/data/cephfs/cb_minute/one_minute_stat/{date}.parquet",
+      "data_type": "one_minute",
+      "path_template": "/data/cephfs/cb_minute/one_minute_stat/{date}.parquet",
+      "sample_date": "2024-12-31",
+      "date_col": "trading_day",
+      "date_col_type": "date"
+    },
+    {
+      "asset": "stk",
+      "freq": "5min",
+      "source": "MinuteParquet",
+      "table": "/data/cephfs/minute/five_minute/{date}.parquet",
+      "data_type": "five_minute",
+      "path_template": "/data/cephfs/minute/five_minute/{date}.parquet",
+      "sample_date": "2024-12-31",
+      "date_col": "trading_day",
+      "date_col_type": "date"
+    }
+  ],
+  "sources": {
+    "stk.1d.adj_factor": {
+      "asset": "stk",
+      "freq": "1d",
+      "name": "adj_factor",
+      "source": "AdjustFactor",
+      "table": "JYDB.DZ_AdjustingFactor",
+      "field": "adj_factor",
+      "params": {}
+    },
+    "stk.1d.is_untradable": {
+      "asset": "stk",
+      "freq": "1d",
+      "name": "is_untradable",
+      "source": "Untradable",
+      "table": "SmartQuant.Untradable",
+      "field": "is_untradable",
+      "value_kind": "mask",
+      "params": {}
+    },
+    "cb.1d.underlying_stk_col": {
+      "asset": "cb",
+      "freq": "1d",
+      "name": "underlying_stk_col",
+      "source": "CBStockMap",
+      "table": "JYDB.Bond_ConBDBasicInfo",
+      "field": "StockInnerCode",
+      "value_kind": "code",
+      "params": {
+        "kind": "col"
+      }
+    },
+    "cb.1d.underlying_stk_inner_code": {
+      "asset": "cb",
+      "freq": "1d",
+      "name": "underlying_stk_inner_code",
+      "source": "CBStockMap",
+      "table": "JYDB.Bond_ConBDBasicInfo",
+      "field": "StockInnerCode",
+      "value_kind": "code",
+      "params": {
+        "kind": "inner_code"
+      }
+    },
+    "stk.1d.industry_code.SW2021.L1": {
+      "asset": "stk",
+      "freq": "1d",
+      "name": "industry_code.SW2021.L1",
+      "source": "ReturnDaily",
+      "table": "SmartQuant.ReturnDaily",
+      "field": "IndustryCodeNew",
+      "value_kind": "code",
+      "params": {}
+    },
+    "stk.1d.index_weight.CSI300": {
+      "asset": "stk",
+      "freq": "1d",
+      "name": "index_weight.CSI300",
+      "source": "IndexComponentWeight_Choice",
+      "table": "SmartQuant.IndexComponentWeight_Choice",
+      "field": "Weight",
+      "params": {
+        "index_inner_code": 3145,
+        "kind": "index_weight"
+      }
+    },
+    "stk.1d.is_member.CSI300": {
+      "asset": "stk",
+      "freq": "1d",
+      "name": "is_member.CSI300",
+      "source": "IndexComponentWeight_Choice",
+      "table": "SmartQuant.IndexComponentWeight_Choice",
+      "field": "Weight",
+      "value_kind": "mask",
+      "params": {
+        "index_inner_code": 3145,
+        "kind": "index_membership"
+      }
+    }
+  }
+}
