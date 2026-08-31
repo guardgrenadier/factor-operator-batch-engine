@@ -290,16 +290,16 @@ def test_output_uses_a_shared_memory_suffix_slice_with_lookback() -> None:
     stream.close()
 
 
-def test_provider_wrong_dtype_is_rejected() -> None:
-    """验证提供方返回非 float64 数据类型时被拒绝。"""
+def test_runtime_requires_a_normalized_source_batch() -> None:
+    """验证 Runtime 拒绝绕过 Source Load 规范化边界的普通映射。"""
 
     class BadProvider(MemoryDataProvider):
-        """返回 float32 数据以触发类型校验的坏提供方。"""
+        """把可信批次降级为普通映射的坏提供方。"""
 
         def load_many(self, bindings):
-            """把加载结果转为 float32 以制造错误数据类型。"""
+            """丢弃规范批次标记以制造边界错误。"""
             values = super().load_many(bindings)
-            return {key: value.astype(np.float32) for key, value in values.items()}
+            return dict(values)
 
     provider = BadProvider(
         dates=DATES,
@@ -312,33 +312,26 @@ def test_provider_wrong_dtype_is_rejected() -> None:
         common_inputs="close = source('stk.1d.close')",
     )
 
-    with pytest.raises(DataProviderError, match="expected float64"):
+    with pytest.raises(DataProviderError, match="NormalizedSourceBatch"):
         BatchFactorEngine(provider).compute(request)
 
 
-def test_provider_wrong_shape_is_rejected() -> None:
-    """验证提供方返回与读取域不符的形状时被拒绝。"""
+def test_memory_provider_normalizes_source_dtype_before_runtime() -> None:
+    """验证内存 Provider 在自己的 Load 边界规范化 dtype。"""
 
-    class BadProvider(MemoryDataProvider):
-        """裁剪资产轴以触发形状校验的坏提供方。"""
-
-        def load_many(self, bindings):
-            """截断资产轴制造错误形状。"""
-            values = super().load_many(bindings)
-            return {key: value[:, :1] for key, value in values.items()}
-
-    provider = BadProvider(
+    provider = MemoryDataProvider(
         dates=DATES,
         asset_codes={"stk": CODES},
-        data={"stk.1d.close": np.ones((5, 2))},
+        data={"stk.1d.close": np.ones((5, 2), dtype=np.int32)},
     )
     request = _request(
         {"alpha": "factor = close"},
         common_inputs="close = source('stk.1d.close')",
     )
 
-    with pytest.raises(DataProviderError, match="returned shape"):
-        BatchFactorEngine(provider).compute(request)
+    result = BatchFactorEngine(provider).compute(request)
+
+    assert result.arrays["alpha"].dtype == np.float64
 
 
 def test_compile_error_includes_formula_id_and_source_position() -> None:
@@ -531,14 +524,11 @@ def test_explicit_intraday_to_daily_resample() -> None:
         for term in result.plan.terms.values()
         if isinstance(term, OperatorTerm) and term.operator_name == "resample"
     )
-    assert source_term.domain is not None
-    assert resample_term.domain is not None
-    assert resample_term.domain.asset_type == source_term.domain.asset_type
-    assert resample_term.domain.codes == source_term.domain.codes
-    assert resample_term.domain.calendar == source_term.domain.calendar
-    assert resample_term.domain.axis_fingerprint == source_term.domain.axis_fingerprint
-    assert resample_term.domain.frequency == "1d"
-    assert resample_term.domain.step_count == 1
+    assert source_term.source_domain.frequency == "1min"
+    assert source_term.layout.step_count == 237
+    assert resample_term.layout.asset_count == source_term.layout.asset_count
+    assert resample_term.layout.step_count == 1
+    assert not hasattr(resample_term, "domain")
     assert resample_term.params == {"boundaries": ((0, 237),), "method": 0}
 
 
@@ -600,7 +590,7 @@ def test_resample_does_not_adopt_a_different_target_asset_domain() -> None:
         ),
     )
 
-    with pytest.raises(DomainError, match="output asset axis does not match target"):
+    with pytest.raises(DomainError, match="asset count 3 cannot broadcast"):
         BatchFactorEngine(provider).compile(request)
 
     assert provider.load_calls == []
@@ -809,7 +799,7 @@ def test_index_member_stat_reuses_the_existing_member_operator(method: str) -> N
     term = job.plan.terms[job.plan.outputs["helper"]]
     assert isinstance(term, OperatorTerm)
     assert term.operator_name == f"member_{method}"
-    assert term.domain is not None and term.domain.codes is None
+    assert term.layout.asset_count == 1
 
 
 def test_index_member_stat_rejects_an_unknown_method_before_loading() -> None:
@@ -843,11 +833,11 @@ def test_index_member_stat_rejects_an_unknown_method_before_loading() -> None:
     assert provider.load_calls == []
 
 
-def test_equal_shapes_with_different_axis_identity_are_rejected() -> None:
-    """验证形状相同但资产轴标识不同的项被拒绝运算。"""
+def test_equal_shapes_with_different_axis_identity_compute_positionally() -> None:
+    """验证形状相同但资产身份不同的项按位置运算。"""
     provider = MemoryDataProvider(
         dates=DATES[:2],
-        asset_codes={"stk": [1, 2], "idx": [1, 2]},
+        asset_codes={"stk": [1, 2], "idx": [2, 1]},
         data={"stk.1d.close": np.ones((2, 2)), "idx.1d.close": np.ones((2, 2))},
     )
     request = ComputeRequest(
@@ -868,8 +858,9 @@ def test_equal_shapes_with_different_axis_identity_are_rejected() -> None:
         ),
     )
 
-    with pytest.raises(Exception, match="incompatible full asset axes"):
-        BatchFactorEngine(provider).compile(request)
+    result = BatchFactorEngine(provider).compute(request)
+
+    np.testing.assert_array_equal(result.arrays["alpha"], 2.0)
 
 
 def test_temporary_factor_repository_save_and_load_factor_round_trip(tmp_path) -> None:

@@ -13,7 +13,9 @@ from ..model import (
     DataProviderError,
     DomainError,
     InputSpec,
+    NormalizedSourceBatch,
     ReadDomain,
+    ReaderRequest,
     SourceBinding,
     SourceTerm,
 )
@@ -28,7 +30,8 @@ from .backend import (
     sql_table,
 )
 from .catalog import Catalog
-from .datasets import load_group
+from .datasets import READER_MODES, READER_REGISTRY, reader_compatibility
+from .normalize import LoadNormalizer
 
 
 class SmartQuantDataProvider:
@@ -110,29 +113,30 @@ class SmartQuantDataProvider:
                 raise DomainError(f"Asset axis {asset_type!r} is already frozen")
             self._event(
                 operation="asset_axis",
-                dataset=dataset["table"],
+                dataset=dataset.params["table"],
                 status="ok",
                 cache_hit=True,
                 physical_queries=0,
             )
             return self._axes[asset_type]
         # 构造日期、交易日标志与显式代码的过滤条件。
-        code_col = str(dataset.get("code_col", "InnerCode"))
+        params = dataset.params
+        code_col = str(params["code_col"])
         filters = [
-            f"{sql_identifier(dataset['date_col'])} BETWEEN {sql_literal(date_keys[0])} "
+            f"{sql_identifier(params['date_col'])} BETWEEN {sql_literal(date_keys[0])} "
             f"AND {sql_literal(date_keys[-1])}"
         ]
         explicit = None if isinstance(selector, str) else tuple(selector)
-        if dataset["trading_flag_col"]:
-            filters.append(f"{sql_identifier(dataset['trading_flag_col'])} = 1")
+        if params.get("trading_flag_col"):
+            filters.append(f"{sql_identifier(params['trading_flag_col'])} = 1")
         if explicit is not None:
             filters.append(f"{sql_identifier(code_col)} IN ({integer_list(explicit)})")
         # 查询资产轴代码并校验显式选择无缺失，最后冻结结果。
         rows = self._query(
             f"SELECT DISTINCT {sql_identifier(code_col)} AS InnerCode "
-            f"FROM {sql_table(dataset['table'])} "
+            f"FROM {sql_table(params['table'])} "
             f"WHERE {' AND '.join(filters)} ORDER BY {sql_identifier(code_col)}",
-            dataset["table"],
+            params["table"],
             "asset_axis",
         )
         found = [int(value) for value in rows[column(rows, "InnerCode")].tolist()]
@@ -164,24 +168,26 @@ class SmartQuantDataProvider:
 
         bindings: list[SourceBinding] = []
         for term in source_terms:
+            # Catalog 负责物理落点；Term 原生坐标负责构造当前分区的 Source ReadDomain。
             source_spec, value_kind = self.catalog.bind(term.source_ref)
-            assert term.domain is not None and term.domain.codes is not None
+            assert source_spec.dataset_id is not None
+            dataset = self.catalog.datasets[source_spec.dataset_id]
+            domain = term.source_domain
+            assert domain.codes is not None
             source_domain = ReadDomain(
                 read_domain.dates,
                 read_domain.write_dates,
-                term.domain.codes,
-                tuple(get_step_values(term.domain.frequency, term.domain.step_count)),
+                domain.codes,
+                tuple(get_step_values(domain.frequency, domain.step_count)),
                 read_domain.output_slice,
             )
-            # 计算加载组键：忽略字段级参数，使同一物理数据集可合并读取。
-            compatibility = dict(source_spec.params)
-            compatibility.pop("column_name", None)
-            compatibility.pop("kind", None)
+            # 只把影响物理行集合或坐标解码的参数放入合批身份，字段和值语义不拆组。
             group = stable_hash(
                 "load_group",
-                source_spec.source,
-                source_spec.table,
-                compatibility,
+                dataset.dataset_id,
+                dataset.reader,
+                dataset.query_builder,
+                reader_compatibility(dataset, source_spec),
                 source_domain.dates,
                 source_domain.codes,
                 source_domain.steps,
@@ -197,22 +203,45 @@ class SmartQuantDataProvider:
             )
         return bindings
 
-    def load_many(self, bindings: Sequence[SourceBinding]) -> Mapping[str, np.ndarray]:
+    def load_many(self, bindings: Sequence[SourceBinding]) -> NormalizedSourceBatch:
         """加载单个加载组内的全部绑定，返回 term_id 到数组的映射。"""
 
         if not bindings:
-            return {}
-        group = bindings[0].load_group_key
-        if any(binding.load_group_key != group for binding in bindings[1:]):
-            raise DataProviderError("load_many requires one LoadGroup")
+            return NormalizedSourceBatch({})
+        dataset_ids = {binding.source_spec.dataset_id for binding in bindings}
+        if len(dataset_ids) != 1 or None in dataset_ids:
+            raise DataProviderError("LoadGroup bindings must reference one dataset")
+        dataset = self.catalog.datasets[str(next(iter(dataset_ids)))]
+
+        # context 只携带 Reader 的运行依赖，不进入公式或 LogicalPlan 语义身份。
+        context: dict[str, Any] = {
+            "sql_backend": self.backend,
+            "duckdb": self.duckdb,
+            "axes": self._axes,
+            "emit": self._event,
+        }
+        if dataset.query_builder == "adjust_factor":
+            context["anchor_dataset"] = self.catalog.datasets[
+                str(dataset.params["anchor_dataset_id"])
+            ]
+        if dataset.reader == "parquet_bars":
+            code_map = dataset.params.get("code_map", {})
+            if code_map.get("mode") == "dated":
+                context["code_map_dataset"] = self.catalog.datasets[
+                    str(code_map["dataset_id"])
+                ]
+        request = ReaderRequest(
+            dataset,
+            tuple(bindings),
+            bindings[0].read_domain,
+            context,
+        )
         try:
-            return load_group(
-                bindings,
-                self.catalog,
-                self.backend,
-                self.duckdb,
-                self._axes,
-                self._event,
+            # Reader 流不落地中间结果，直接由唯一 LoadNormalizer 增量消费。
+            return LoadNormalizer(
+                bindings, READER_MODES[dataset.reader]
+            ).normalize(
+                READER_REGISTRY[dataset.reader](request)
             )
         except DataProviderError:
             raise

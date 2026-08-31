@@ -20,6 +20,7 @@ from .model import (
     ExecutionStats,
     LiteralTerm,
     LogicalPlan,
+    NormalizedSourceBatch,
     OperatorTerm,
     PhysicalPartition,
     ReadDomain,
@@ -195,16 +196,18 @@ class Runtime:
                     loaded = self.provider.load_many(group)
                     stats.load_calls += 1
                     try:
+                        # NormalizedSourceBatch 是 Source Load 边界的可信标记；Runtime
+                        # 只核对批次类型和 term_id，不再重复扫描 dtype、shape 或 ValueKind。
+                        if not isinstance(loaded, NormalizedSourceBatch):
+                            raise DataProviderError(
+                                "load_many must return NormalizedSourceBatch"
+                            )
                         if set(loaded) != {binding.term_id for binding in group}:
                             raise DataProviderError(
                                 "load_many returned incomplete or extra terms"
                             )
                         for binding in group:
-                            source_term = plan.terms[binding.term_id]
-                            assert isinstance(source_term, SourceTerm)
-                            workspace[binding.term_id] = _validate_loaded(
-                                loaded[binding.term_id], source_term, binding
-                            )
+                            workspace[binding.term_id] = loaded[binding.term_id]
                     finally:
                         del loaded
             elif isinstance(term, OperatorTerm):
@@ -354,44 +357,6 @@ class BatchFactorEngine:
         )
 
 
-def _validate_loaded(
-    value: Any, term: SourceTerm, binding: SourceBinding
-) -> np.ndarray:
-    """校验数据源结果的 float64 类型和精确三维形状。"""
-    # 数据提供者必须严格遵守绑定阶段确定的 dtype 与形状契约。
-    array = np.asarray(value)
-    expected = (
-        len(binding.read_domain.dates),
-        len(binding.read_domain.codes),
-        term.input_spec.step_count,
-    )
-    if array.dtype != np.float64:
-        raise DataProviderError(
-            f"Source {term.source_ref.logical_key!r} returned dtype {array.dtype}, expected float64"
-        )
-    if array.shape != expected:
-        raise DataProviderError(
-            f"Source {term.source_ref.logical_key!r} returned shape {array.shape}, expected {expected}"
-        )
-    # Source 边界统一把无穷值规范为缺失值。
-    if np.any(np.isinf(array)):
-        array = array.copy()
-        array[np.isinf(array)] = np.nan
-    # MASK 和 CODE 额外校验各自的语义值域。
-    if term.value_kind is ValueKind.MASK:
-        try:
-            as_tristate_mask(array, name=f"Source {term.source_ref.logical_key!r} mask")
-        except ValueError as exc:
-            raise DataProviderError(str(exc)) from exc
-    elif term.value_kind is ValueKind.CODE:
-        finite = array[np.isfinite(array)]
-        if np.any(finite != np.floor(finite)):
-            raise DataProviderError(
-                f"Code source {term.source_ref.logical_key!r} contains non-integer values"
-            )
-    return array
-
-
 def _validate_operator_result(
     value: Any, term: OperatorTerm, partition: PhysicalPartition
 ) -> Any:
@@ -409,13 +374,17 @@ def _validate_operator_result(
             raise RuntimeExecutionError(
                 f"Code operator {term.operator_name!r} contains non-integer values"
             )
-    if array.ndim == 0 and term.domain is None:
+    if term.layout.scalar:
+        if array.ndim != 0:
+            raise RuntimeExecutionError(
+                f"Operator {term.operator_name!r} returned shape {array.shape}, expected scalar"
+            )
         return array
-    # 非标量结果必须精确匹配编译器推导的原生领域。
+    # 非标量结果必须精确匹配编译器推导的原生 ArrayLayout。
     expected = (
         len(partition.read_domain.dates),
-        term.domain.asset_count if term.domain is not None else 1,
-        term.domain.step_count if term.domain is not None else 1,
+        term.layout.asset_count,
+        term.layout.step_count,
     )
     if array.shape != expected:
         raise RuntimeExecutionError(

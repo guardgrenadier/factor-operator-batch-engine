@@ -1,5 +1,10 @@
 # 调用链设计解读：从公式字符串到因子数组
 
+> 本文按当前代码走读；其中 `TermDomain`、`domain_rule` 和 Runtime 重复校验
+> 尚未按新目标设计迁移。新契约见
+> [`ADR-0001`](adr/0001-use-positional-array-layout-for-operators.md) 与
+> [`Reader与Load规范化边界设计.md`](Reader与Load规范化边界设计.md)。
+
 - 更新日期：2026-08-19
 - 文档类型：Walkthrough / Explanation（走读式解读）。按真实调用顺序逐步讲解
   每一步的**设计目的**和**数据形态变化**，并全程带一个可运行例子。

@@ -21,14 +21,14 @@ class VariadicInput:
 
 @dataclass(frozen=True)
 class OperatorSpec:
-    """单个算子的契约：函数、输入输出值类型、Lookback 与领域规则。"""
+    """单个算子的契约：函数、值类型、Lookback 与数组布局规则。"""
 
     name: str
     func: Callable[..., Any]
     input_kinds: tuple[ValueKind, ...] | VariadicInput
     output_kind: ValueKind | str
     date_lookback: int | Callable[[dict[str, Any]], int] = 0
-    domain_rule: Callable[[tuple[Any | None, ...], Mapping[str, Any]], Any] | None = (
+    layout_rule: Callable[[tuple[Any, ...], Mapping[str, Any]], Any] | None = (
         None
     )
     optional_inputs: tuple[tuple[str, ValueKind], ...] = ()

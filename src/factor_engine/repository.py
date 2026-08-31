@@ -18,12 +18,14 @@ from .model import (
     DataProvider,
     DataProviderError,
     InputSpec,
+    NormalizedSourceBatch,
     ReadDomain,
     ResultAssemblyError,
     SourceBinding,
     SourceSpec,
     SourceTerm,
 )
+from .data_provider.normalize import normalize_source_arrays
 
 
 class TemporaryFactorRepository:
@@ -214,13 +216,13 @@ class RepositoryDataProvider:
         for term in factors:
             factor_id = term.source_ref.logical_key.removeprefix("factor:")
             metadata = self.repository.metadata(factor_id)
-            assert term.domain is not None
-            assert term.domain.codes is not None
+            domain = term.source_domain
+            assert domain.codes is not None
             # 因子沿用 Term 原生资产轴和持久化 step 坐标。
             factor_domain = ReadDomain(
                 read_domain.dates,
                 read_domain.write_dates,
-                term.domain.codes,
+                domain.codes,
                 tuple(metadata["steps"]),
                 read_domain.output_slice,
             )
@@ -247,7 +249,7 @@ class RepositoryDataProvider:
             )
         return result
 
-    def load_many(self, bindings: Sequence[SourceBinding]) -> Mapping[str, np.ndarray]:
+    def load_many(self, bindings: Sequence[SourceBinding]) -> NormalizedSourceBatch:
         """从临时仓库和基础提供者批量加载对应绑定。"""
         # 按来源拆组，普通绑定批量委托，因子绑定逐项从仓库装配。
         factors = [
@@ -256,13 +258,21 @@ class RepositoryDataProvider:
             if binding.source_spec.source == "temporary_factor_repository"
         ]
         ordinary = [binding for binding in bindings if binding not in factors]
-        result = dict(self.base.load_many(ordinary)) if ordinary else {}
+        if ordinary and factors:
+            raise DataProviderError("Repository load_many requires one LoadGroup")
+        if ordinary:
+            return self.base.load_many(ordinary)
+        if not factors:
+            return NormalizedSourceBatch({})
+
+        # 仓库数组已按 ReadDomain 装配，交给统一稠密边界校验后再标记为可信。
+        result: dict[str, np.ndarray] = {}
         for binding in factors:
             factor_id = str(binding.source_spec.params["factor_id"])
             result[binding.term_id] = self.repository.load(
                 factor_id, binding.read_domain
             )
-        return result
+        return normalize_source_arrays(factors, result)
 
 
 def _safe_factor_id(factor_id: str) -> None:

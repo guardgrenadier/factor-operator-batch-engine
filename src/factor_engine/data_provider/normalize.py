@@ -1,157 +1,275 @@
-"""把物理查询返回的长表结果严格散布到绑定共同坐标与值协议。"""
+"""RawBatch 进入 Runtime 前的唯一 Source 数组规范化边界。"""
 
 from __future__ import annotations
 
-from typing import Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
 from ..domain import ValueKind, normalize_date_key
-from ..model import DataProviderError, SourceBinding
-from .backend import column
+from ..model import (
+    DataProviderError,
+    NormalizedSourceBatch,
+    RawBatch,
+    ReadDomain,
+    SourceBinding,
+)
 
 
-def scatter_rows(
-    bindings: Sequence[SourceBinding],
-    rows: pd.DataFrame,
-    fields: Mapping[str, str],
-    *,
-    step_col: str | None = None,
-    constants: Mapping[str, float] | None = None,
-    defaults: Mapping[str, float] | None = None,
-) -> dict[str, np.ndarray]:
-    """将规范长表严格散布到一组 binding 的共同坐标。"""
+class LoadNormalizer:
+    """增量消费一个 LoadGroup 的 RawBatch 并原子地产生规范数组。"""
 
-    if rows.empty:
-        return _empty(bindings, defaults)
-    domain = bindings[0].read_domain
-    date_name, code_name = column(rows, "DataDate"), column(rows, "InnerCode")
-    coordinate_names = [date_name, code_name]
-    dates = [normalize_date_key(value) for value in rows[date_name]]
-    codes = pd.to_numeric(rows[code_name], errors="raise").astype(int).tolist()
-    date_pos = {value: pos for pos, value in enumerate(domain.dates)}
-    code_pos = {int(value): pos for pos, value in enumerate(domain.codes)}
-    try:
-        date_index = np.asarray([date_pos[value] for value in dates], dtype=np.intp)
-        asset_index = np.asarray([code_pos[value] for value in codes], dtype=np.intp)
-    except KeyError as exc:
-        raise DataProviderError(
-            f"Backend returned coordinate outside ReadDomain: {exc.args[0]!r}"
-        ) from exc
-    if step_col is None:
-        step_index = np.zeros(len(rows), dtype=np.intp)
-    else:
-        step_name = column(rows, step_col)
-        coordinate_names.append(step_name)
-        step_index = pd.to_numeric(rows[step_name], errors="raise").to_numpy(
-            dtype=np.intp
+    def __init__(
+        self,
+        bindings: Sequence[SourceBinding],
+        coordinate_mode: str,
+    ) -> None:
+        """校验 LoadGroup 契约，并按 Source default 预分配最终数组。"""
+
+        self.bindings = tuple(bindings)
+        self.coordinate_mode = coordinate_mode
+        self.domain, self.term_ids = _binding_contract(self.bindings)
+        if coordinate_mode not in {"labels", "flat", "static"}:
+            raise DataProviderError(f"Unknown RawBatch coordinate mode {coordinate_mode!r}")
+        if coordinate_mode == "static" and len(self.domain.steps) != 1:
+            raise DataProviderError("Static RawBatch requires a singleton step axis")
+
+        self.shape = (
+            len(self.domain.dates),
+            len(self.domain.codes),
+            len(self.domain.steps),
         )
-        if np.any((step_index < 0) | (step_index >= len(domain.steps))):
-            raise DataProviderError("Backend returned step outside ReadDomain")
-    if rows.duplicated(coordinate_names).any():
-        raise DataProviderError(
-            "Backend returned duplicate date/asset/step coordinates"
-        )
-    rows.drop(columns=coordinate_names, inplace=True)
-    result = _empty(bindings, defaults)
-    constants = constants or {}
-    for binding in bindings:
-        if binding.term_id in constants:
-            result[binding.term_id][date_index, asset_index, step_index] = constants[
-                binding.term_id
-            ]
-        else:
-            result[binding.term_id][date_index, asset_index, step_index] = values(
-                rows[column(rows, fields[binding.term_id])],
-                binding.value_kind,
-                binding.source_spec.key,
+        # 先写入完整默认值，Reader 未返回的坐标自然保留 Source 的缺失语义。
+        self.arrays = {
+            binding.term_id: np.full(
+                self.shape,
+                _default_value(binding),
+                dtype=np.float64,
             )
-    return result
-
-
-def scatter_positions(
-    bindings: Sequence[SourceBinding],
-    rows: pd.DataFrame,
-    fields: Mapping[str, str],
-) -> dict[str, np.ndarray]:
-    """散布已由物理查询映射为三维整数位置的结果。"""
-
-    if rows.empty:
-        return _empty(bindings)
-    names = [column(rows, name) for name in ("date_idx", "asset_idx", "step_idx")]
-    if rows.duplicated(names).any():
-        raise DataProviderError(
-            "Backend returned duplicate date/asset/step coordinates"
+            for binding in self.bindings
+        }
+        occupied_size = len(self.domain.codes) if coordinate_mode == "static" else int(
+            np.prod(self.shape)
         )
-    indices = tuple(
-        pd.to_numeric(rows[name], errors="raise").to_numpy(dtype=np.intp)
-        for name in names
-    )
-    domain = bindings[0].read_domain
+        self.occupied = np.zeros(occupied_size, dtype=np.bool_)
+
+    def normalize(self, batches: Iterable[RawBatch]) -> NormalizedSourceBatch:
+        """消费完整流；任一 batch 失败时不交付任何部分数组。"""
+
+        iterator = iter(batches)
+        try:
+            for batch in iterator:
+                # 每个 batch 依次完成协议、坐标、重复和值校验，再写入私有数组。
+                coordinates, values, length = self._validate_batch(batch)
+                positions = self._positions(coordinates, length)
+                self._reject_duplicates(positions)
+                for binding in self.bindings:
+                    converted = _convert_column(
+                        values[binding.term_id],
+                        binding.value_kind,
+                        binding.source_spec.key,
+                    )
+                    if self.coordinate_mode == "static":
+                        self.arrays[binding.term_id][:, positions, 0] = converted
+                    else:
+                        self.arrays[binding.term_id].reshape(-1)[positions] = converted
+        finally:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+        return _finalize(self.bindings, self.arrays)
+
+    def _validate_batch(
+        self, batch: RawBatch
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], int]:
+        """校验 RawBatch 模式、键集合、一维列和等长约束。"""
+
+        if not isinstance(batch, RawBatch):
+            raise DataProviderError("Reader must yield RawBatch values")
+        if batch.coordinate_mode != self.coordinate_mode:
+            raise DataProviderError(
+                f"Reader yielded {batch.coordinate_mode!r}, expected {self.coordinate_mode!r}"
+            )
+        coordinate_keys = set(batch.coordinates)
+        if self.coordinate_mode == "labels":
+            if coordinate_keys not in ({"date", "asset"}, {"date", "asset", "step"}):
+                raise DataProviderError("Labels RawBatch requires date, asset, and optional step")
+            if "step" not in coordinate_keys and len(self.domain.steps) != 1:
+                raise DataProviderError(
+                    "Labels RawBatch without step requires a singleton step axis"
+                )
+        elif self.coordinate_mode == "flat" and coordinate_keys != {"flat_idx"}:
+            raise DataProviderError("Flat RawBatch requires only flat_idx")
+        elif self.coordinate_mode == "static" and coordinate_keys != {"asset"}:
+            raise DataProviderError("Static RawBatch requires only asset")
+        if set(batch.values) != self.term_ids:
+            raise DataProviderError("RawBatch values must match all LoadGroup term_ids")
+
+        coordinates = {
+            key: _one_dimensional(value, f"coordinate {key!r}")
+            for key, value in batch.coordinates.items()
+        }
+        values = {
+            key: _one_dimensional(value, f"value {key!r}")
+            for key, value in batch.values.items()
+        }
+        lengths = {len(value) for value in (*coordinates.values(), *values.values())}
+        if len(lengths) != 1:
+            raise DataProviderError("RawBatch coordinates and values must have equal lengths")
+        return coordinates, values, lengths.pop()
+
+    def _positions(
+        self,
+        coordinates: Mapping[str, np.ndarray],
+        length: int,
+    ) -> np.ndarray:
+        """把 labels、flat 或 static 坐标解析为最终数组的位置。"""
+
+        if self.coordinate_mode == "flat":
+            positions = _integer_coordinates(coordinates["flat_idx"], "flat_idx")
+            if np.any((positions < 0) | (positions >= int(np.prod(self.shape)))):
+                raise DataProviderError("Backend returned position outside ReadDomain")
+            return positions
+
+        asset_positions = _label_positions(
+            coordinates["asset"], self.domain.codes, "asset"
+        )
+        if self.coordinate_mode == "static":
+            return asset_positions
+
+        date_labels = [normalize_date_key(value) for value in coordinates["date"]]
+        date_positions = _label_positions(date_labels, self.domain.dates, "date")
+        if "step" in coordinates:
+            step_positions = _label_positions(
+                coordinates["step"], self.domain.steps, "step"
+            )
+        else:
+            step_positions = np.zeros(length, dtype=np.intp)
+        return (
+            date_positions * (len(self.domain.codes) * len(self.domain.steps))
+            + asset_positions * len(self.domain.steps)
+            + step_positions
+        )
+
+    def _reject_duplicates(self, positions: np.ndarray) -> None:
+        """拒绝当前 batch 内及此前 batch 已占用的重复位置。"""
+
+        if len(np.unique(positions)) != len(positions) or self.occupied[positions].any():
+            raise DataProviderError(
+                "Backend returned duplicate date/asset/step coordinates"
+            )
+        self.occupied[positions] = True
+
+
+def normalize_source_arrays(
+    bindings: Sequence[SourceBinding],
+    values: Mapping[str, Any],
+) -> NormalizedSourceBatch:
+    """规范已经按最终位置装配的 Provider 数组，并标记为可信批次。"""
+
+    domain, term_ids = _binding_contract(bindings)
+    if set(values) != term_ids:
+        raise DataProviderError("Source arrays must match all LoadGroup term_ids")
     shape = (len(domain.dates), len(domain.codes), len(domain.steps))
-    if any(
-        np.any((index < 0) | (index >= shape[axis]))
-        for axis, index in enumerate(indices)
-    ):
-        raise DataProviderError("Backend returned position outside ReadDomain")
-    rows.drop(columns=names, inplace=True)
-    result = _empty(bindings)
+    arrays: dict[str, np.ndarray] = {}
     for binding in bindings:
-        result[binding.term_id][indices] = values(
-            rows[column(rows, fields[binding.term_id])],
-            binding.value_kind,
-            binding.source_spec.key,
-        )
-    return result
+        raw = np.asarray(values[binding.term_id])
+        if raw.shape != shape:
+            raise DataProviderError(
+                f"Source {binding.source_spec.key!r} returned shape {raw.shape}, expected {shape}"
+            )
+        arrays[binding.term_id] = _convert_column(
+            raw.reshape(-1), binding.value_kind, binding.source_spec.key
+        ).reshape(shape)
+    return _finalize(bindings, arrays)
 
 
-def scatter_static(
+def _binding_contract(
     bindings: Sequence[SourceBinding],
-    rows: pd.DataFrame,
-    fields: Mapping[str, str],
-    *,
-    prepared: Mapping[str, pd.Series | np.ndarray] | None = None,
-) -> dict[str, np.ndarray]:
-    """将无日期关系沿任务日期轴广播。"""
+) -> tuple[ReadDomain, set[str]]:
+    """确认 bindings 属于同一 LoadGroup、共享 ReadDomain 且 term_id 唯一。"""
 
-    if rows.empty:
-        return _empty(bindings)
-    code_name = column(rows, "InnerCode")
-    if rows.duplicated(code_name).any():
-        raise DataProviderError("Backend returned duplicate static asset coordinates")
-    domain = bindings[0].read_domain
-    positions = {int(value): pos for pos, value in enumerate(domain.codes)}
-    codes = pd.to_numeric(rows[code_name], errors="raise").astype(int).tolist()
-    rows.drop(columns=[code_name], inplace=True)
-    result = _empty(bindings)
-    prepared = prepared or {}
-    for binding in bindings:
-        source = (
-            prepared[binding.term_id]
-            if binding.term_id in prepared
-            else rows[column(rows, fields[binding.term_id])]
-        )
-        converted = values(
-            source,
+    if not bindings:
+        raise DataProviderError("LoadNormalizer requires at least one binding")
+    first = bindings[0]
+    if any(binding.load_group_key != first.load_group_key for binding in bindings[1:]):
+        raise DataProviderError("LoadNormalizer requires one LoadGroup")
+    if any(binding.read_domain != first.read_domain for binding in bindings[1:]):
+        raise DataProviderError("LoadGroup bindings must share one ReadDomain")
+    term_ids = {binding.term_id for binding in bindings}
+    if len(term_ids) != len(bindings):
+        raise DataProviderError("LoadGroup term_ids must be unique")
+    return first.read_domain, term_ids
+
+
+def _default_value(binding: SourceBinding) -> float:
+    """按 Source ValueKind 规范并校验单个默认值。"""
+
+    return float(
+        _convert_column(
+            np.asarray([binding.source_spec.default], dtype=object),
             binding.value_kind,
             binding.source_spec.key,
-        )
-        for code, value in zip(codes, converted, strict=True):
-            if code in positions:
-                result[binding.term_id][:, positions[code], 0] = value
-    return result
+        )[0]
+    )
 
 
-def values(
-    series: pd.Series | np.ndarray, kind: ValueKind, source_key: str
-) -> np.ndarray:
-    """按 Catalog 声明一次性转换并校验 Runtime 值协议。"""
+def _one_dimensional(value: Any, name: str) -> np.ndarray:
+    """把 pandas、Arrow 或 NumPy 列转为一维 NumPy 视图。"""
 
-    converted = pd.to_numeric(series, errors="coerce")
-    if np.any(pd.notna(series) & pd.isna(converted)):
+    if hasattr(value, "to_numpy") and not isinstance(value, np.ndarray):
+        try:
+            array = value.to_numpy(zero_copy_only=False)
+        except TypeError:
+            array = value.to_numpy()
+    else:
+        array = np.asarray(value)
+    if array.ndim != 1:
+        raise DataProviderError(f"RawBatch {name} must be one-dimensional")
+    return array
+
+
+def _integer_coordinates(values: np.ndarray, name: str) -> np.ndarray:
+    """把位置坐标转换为有限整数索引。"""
+
+    converted = pd.to_numeric(values, errors="coerce")
+    array = np.asarray(converted, dtype=np.float64)
+    if np.any(~np.isfinite(array)) or np.any(array != np.floor(array)):
+        raise DataProviderError(f"RawBatch {name} must contain finite integers")
+    return array.astype(np.intp)
+
+
+def _label_positions(values: Iterable[Any], labels: Sequence[Any], name: str) -> np.ndarray:
+    """把标签列映射到冻结轴位置，并拒绝 ReadDomain 外的标签。"""
+
+    positions = {value: index for index, value in enumerate(labels)}
+    result: list[int] = []
+    try:
+        for raw in values:
+            value = raw.item() if isinstance(raw, np.generic) else raw
+            try:
+                result.append(positions[value])
+            except (KeyError, TypeError):
+                result.append(positions[int(value)])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DataProviderError(
+            f"Backend returned {name} coordinate outside ReadDomain"
+        ) from exc
+    return np.asarray(result, dtype=np.intp)
+
+
+def _convert_column(values: Any, kind: ValueKind, source_key: str) -> np.ndarray:
+    """统一数值化、Infinity 处理和 MASK/CODE 有限值校验。"""
+
+    raw = np.asarray(values)
+    converted = pd.to_numeric(raw, errors="coerce")
+    if np.any(pd.notna(raw) & pd.isna(converted)):
         raise DataProviderError(f"Source {source_key!r} contains non-numeric values")
     array = np.asarray(converted, dtype=np.float64)
+    if np.any(np.isinf(array)):
+        array = array.copy()
+        array[np.isinf(array)] = np.nan
     finite = array[np.isfinite(array)]
     if kind is ValueKind.MASK and np.any((finite != 0.0) & (finite != 1.0)):
         raise DataProviderError(
@@ -161,28 +279,26 @@ def values(
         raise DataProviderError(
             f"Code source {source_key!r} contains non-integer values"
         )
-    if np.any(np.isinf(array)):
-        array = array.copy()
-        array[np.isinf(array)] = np.nan
     return array
 
 
-def _empty(
-    bindings: Sequence[SourceBinding],
-    defaults: Mapping[str, float] | None = None,
-) -> dict[str, np.ndarray]:
-    """为每个绑定创建读取域形状的数组，用默认值或 NaN 填充。"""
+def _finalize(
+    bindings: Sequence[SourceBinding], arrays: Mapping[str, np.ndarray]
+) -> NormalizedSourceBatch:
+    """复核 term_id、shape、dtype，并交付只读规范批次。"""
 
-    defaults = defaults or {}
-    return {
-        binding.term_id: np.full(
-            (
-                len(binding.read_domain.dates),
-                len(binding.read_domain.codes),
-                len(binding.read_domain.steps),
-            ),
-            defaults.get(binding.term_id, np.nan),
-            dtype=np.float64,
-        )
-        for binding in bindings
-    }
+    if set(arrays) != {binding.term_id for binding in bindings}:
+        raise DataProviderError("Normalized Source arrays have incomplete term_ids")
+    domain = bindings[0].read_domain
+    shape = (len(domain.dates), len(domain.codes), len(domain.steps))
+    finalized: dict[str, np.ndarray] = {}
+    for binding in bindings:
+        array = arrays[binding.term_id]
+        if array.dtype != np.float64 or array.shape != shape:
+            raise DataProviderError("Normalized Source array has invalid dtype or shape")
+        array.flags.writeable = False
+        finalized[binding.term_id] = array
+    return NormalizedSourceBatch(finalized)
+
+
+__all__ = ["LoadNormalizer", "normalize_source_arrays"]

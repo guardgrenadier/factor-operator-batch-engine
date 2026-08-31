@@ -442,56 +442,56 @@ loader 必须通过权威代码表获得映射；映射可能是静态全集，�
 - 任何方案都不得扩大单次 parquet read domain、改变 `chunk_size` 语义或形成跨任务缓存；
 - 保留日期维度，不能假设 `SecuCode` 与 `InnerCode` 的关系永久不变。
 
-## 11. 补齐 Domain 校验路径的测试覆盖
+## 11. 用按位置 ArrayLayout 测试替换普通算子 Domain 校验
 
 ### 目标
 
-Domain 体系的核心承诺是"非法域在编译期响亮报错、绝不静默错位"，但大量校验分支目前没有任何测试断言，该安全机制不受测试保护。需要先补刻画测试，再谈对该层的任何重构。
+落实 [ADR-0001](adr/0001-use-positional-array-layout-for-operators.md)：删除普通算子的
+资产、频率、日历和 axis fingerprint 兼容性测试，改为锁定纯 shape 与 NumPy 广播契约。
 
 ### 当前状态
 
-- `Compiler._resolve_domain()` 的全部校验分支（target_asset 不在 asset_scope、多日历冲突、日期区间为空、asset_scope 未覆盖输入资产、非法 selector、显式子集为空、显式子集重复、未知资产代码）零测试断言；
-- `operators/domain_rules.py` 仅 "incompatible frequencies" 与 "align it explicitly" 被 `tests/test_alignment_rules.py` 覆盖；"must share the same full asset axis"、"Incompatible step dimensions"、"cannot select the partitioned date axis"、"empty step axis"、位置越界等分支均未覆盖；
-- `_validate_output_domain()` 仅资产轴不匹配一个分支被覆盖（`tests/test_batch_engine.py`），标量输出、日历不匹配、频率不兼容、step 数不可广播均未覆盖。
+- 当前测试仍断言相同 shape、不同轴身份必须失败，与新决策相反；
+- `operators/domain_rules.py` 和 `_validate_output_domain()` 仍执行旧语义；
+- OutputDomain、ReadDomain 和 Source Load 边界的校验仍需保留。
 
 ### 实现要点
 
-- 用 `MemoryDataProvider` 构造最小用例逐分支锁定错误类型与消息，不依赖真实后端；
-- 重点覆盖 domain_rules 的广播边界：singleton 广播、两个不同名满轴混合、1d singleton 并入日内的豁免与其失效条件、step 数不兼容；
-- 覆盖 `_resolve_domain()` 的 lookback 外扩边界（回看超过日历起点时的 `max(0, ...)` 钳制）与显式代码子集的成功路径；
-- 补测试过程中如发现错误消息表述不一致，先记录、不顺手改语义；
-- 测试就位后，再评估是否收敛错误消息为公开契约。
+- 覆盖 T 必须匹配当前分区、N/S 相等或 singleton 广播；
+- 增加相同 N/S、不同资产类型、代码顺序、frequency 和 step 业务含义的成功用例；
+- 保留显式 `resample/align/select/project` 的 layout 结果测试；
+- 保留 OutputDomain、ReadDomain、SourceBinding 和 Provider 坐标散布测试。
 
 ### 验收标准
 
-- 上述每个编译期 Domain 校验分支至少有一条断言错误类型与消息的测试；
-- domain_rules 的每类广播/拒绝规则都有正例与反例；
+- 普通 operator 不再因业务坐标身份不同失败；
+- N/S 不可广播和最终输出 shape 不兼容仍明确失败；
 - 全量测试与 ruff 通过，且新增测试能捕获对校验逻辑的回归修改。
 
-## 12. 收敛 TermDomain 与 ResolvedOutputDomain 的镜像关系
+## 12. 用 ArrayLayout 替换普通 OperatorTerm 的 TermDomain
 
 ### 目标
 
-明确"任务输出域"与"Term 域"两个概念的边界，消除手工逐字段复制，降低 Domain 类型族的学习和维护成本。
+删除普通 OperatorTerm 的业务坐标身份，只保留纯结构 ArrayLayout；OutputDomain、
+ReadDomain、InputSpec 和 SourceBinding 继续承担各自边界的权威坐标职责。
 
 ### 当前状态
 
-- `TermDomain` 与 `ResolvedOutputDomain` 各自携带 asset_type、codes、frequency、calendar、指纹五元组，`_term_domain()`（`compiler.py`）在两者之间手工逐字段复制；
-- `ResolvedOutputDomain` 额外持有完整 dates 与 steps 值（结果装配需要）；`TermDomain` 只记录 step_count，并参与 semantic key 哈希；
-- `TermDomain` 必须保持 frozen 且可哈希；`ResolvedOutputDomain` 含 NumPy 数组，不可哈希。二者确有真实差异，不能简单合并为一个类型。
+- `TermDomain` 仍嵌入 OperatorTerm、semantic key、domain_rule 和 Runtime shape 校验；
+- 该实现与 ADR-0001 的目标模型不一致。
 
 ### 实现要点
 
-- 先评估两种收敛深度：仅把 `_term_domain()` 改为 `ResolvedOutputDomain` 上的构造方法消除手工复制，或让 `ResolvedOutputDomain` 内嵌 `TermDomain`；
-- 保持 `TermDomain` 的不可变与可哈希性，NumPy 数组不得进入 semantic key；
-- 不改变 semantic key 中域身份的构成语义；如调整哈希输入结构，须同步说明对 semantic identity 的影响；
-- 同步更新 `CONTEXT.md` 的 Domain 词条与 `docs/资产轴对齐规则.md` 的相关表述。
+- ArrayLayout 只表达 T/N/S 结构和有限 layout effect，不保存 codes、calendar 或指纹；
+- OperatorTerm semantic identity 不再包含业务 Domain；
+- Source 取数需要的资产、频率和 step 信息继续保留在 InputSpec/SourceBinding；
+- 坐标敏感的显式 operator 缺少唯一元数据时要求调用方补充参数。
 
 ### 验收标准
 
-- `_term_domain()` 的手工字段复制被消除；
-- 两个类型的职责差异（任务输出域 vs Term 身份）在类型定义处有明确说明；
-- semantic identity 行为不变，全量测试通过。
+- 普通 OperatorTerm 不再携带 TermDomain 或调用 domain_rule；
+- shape-changing operator 只保留结构性 layout effect；
+- LogicalPlan semantic identity 按新契约稳定，全量测试通过。
 
 ## 13. 类型化 Catalog 配置管道并统一 SQL 谓词构造
 
@@ -517,3 +517,47 @@ Domain 体系的核心承诺是"非法域在编译期响亮报错、绝不静默
 - Catalog 内部与 loader 中不再出现 dataset/source 记录的字符串索引访问；
 - 日期/代码/交易日标志过滤只存在一处构造逻辑；
 - `tests/test_smartquant_provider.py` 与 `tests/test_data_provider_backend.py` 全量通过，物理查询次数诊断不变。
+
+## 14. 为 Provider 增加数据源白名单
+
+### 目标
+
+允许创建 Provider 时声明本任务可以使用的逻辑数据源集合；公式引用未获允许的
+`SourceRefExpr` 时，应在 `describe_many()` 阶段、发生物理绑定和数据加载前明确失败。
+
+### 实现要点
+
+- 第一版优先使用精确逻辑 source key，不引入通配符或复杂权限规则；
+- `None` 表示不限制，显式空集合表示不允许任何普通数据源；
+- 白名单是 Provider 访问策略，不改变 Source、Term 或 LogicalPlan 的语义身份；
+- 明确 helper 自动注入的依赖 Source 是否也必须显式进入白名单；
+- 错误信息包含被拒绝的逻辑 source key。
+
+### 验收标准
+
+- 白名单内 Source 可以正常 describe、bind 和 load；
+- 白名单外 Source 在任何物理查询前失败；
+- 同一 LoadGroup 混合允许与拒绝 Source 时不会产生部分加载；
+- 未配置白名单时保持当前行为。
+
+## 15. 调整资产代码轴的取数方式
+
+### 目标
+
+修改 `SmartQuantDataProvider.asset_codes()` 当前的资产代码轴取数方式。新的权威数据源、
+查询范围和筛选口径确认后，再同步实现与 Domain 文档；本 TODO 不预设具体业务口径。
+
+### 实现要点
+
+- 明确 `asset_scope="all"` 的准确含义及资产代码的权威来源；
+- 明确资产轴是否依赖任务日期/read horizon、交易标志或其他状态字段；
+- 保持显式资产子集的未知代码校验、调用方顺序和去重规则；
+- 同一任务内资产轴继续保持稳定，不按 PhysicalPartition 分别解析；
+- 更新 Provider 测试以及正式设计、DataProvider 设计和调用链文档中的对应说明。
+
+### 验收标准
+
+- 股票、转债和指数资产轴均按确认后的新规则解析；
+- whole-domain 与不同 `chunk_size` 使用同一任务资产轴；
+- 显式子集、未知代码、空资产轴和代码顺序均有测试覆盖；
+- 旧取数规则不再残留为隐式 fallback。

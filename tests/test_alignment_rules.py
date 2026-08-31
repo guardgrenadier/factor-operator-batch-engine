@@ -82,8 +82,8 @@ def test_daily_singleton_and_daily_multistep_use_numpy_broadcasting() -> None:
     )
 
 
-def test_daily_multistep_cannot_mix_directly_with_intraday_steps() -> None:
-    """验证日频多 step 不能直接与日内 step 运算。"""
+def test_equal_layouts_with_daily_and_intraday_frequency_compute_positionally() -> None:
+    """验证相同 N/S 的不同频率输入按位置运算。"""
     values = np.ones((2, 3, 4), dtype=np.float64)
     provider = MemoryDataProvider(
         dates=DATES,
@@ -104,14 +104,13 @@ def test_daily_multistep_cannot_mix_directly_with_intraday_steps() -> None:
         target_step_count=4,
     )
 
-    with pytest.raises(DomainError, match="incompatible frequencies"):
-        BatchFactorEngine(provider).compile(request)
+    result = BatchFactorEngine(provider).compute(request)
 
-    assert provider.load_calls == []
+    np.testing.assert_array_equal(result.arrays["alpha"], values * 2)
 
 
-def test_different_intraday_frequencies_require_explicit_alignment() -> None:
-    """验证不同日内频率间需要显式对齐才能运算。"""
+def test_equal_layouts_with_different_intraday_frequencies_compute_positionally() -> None:
+    """验证不同日内频率但相同 N/S 的输入按位置运算。"""
     values = np.ones((2, 3, 4), dtype=np.float64)
     provider = MemoryDataProvider(
         dates=DATES,
@@ -129,8 +128,87 @@ def test_different_intraday_frequencies_require_explicit_alignment() -> None:
         target_step_count=4,
     )
 
-    with pytest.raises(DomainError, match="incompatible frequencies"):
+    result = BatchFactorEngine(provider).compute(request)
+
+    np.testing.assert_array_equal(result.arrays["alpha"], values * 2)
+
+
+def test_equal_layouts_with_different_calendars_compute_positionally() -> None:
+    """验证普通 Operator 不比较 Source calendar 身份。"""
+
+    values = np.ones((2, 3, 1), dtype=np.float64)
+    provider = MemoryDataProvider(
+        dates=DATES,
+        asset_codes={"stk": STOCKS, "idx": [300, 500, 800]},
+        data={"stk.1d.x": values, "idx.1d.y": values},
+        input_specs={
+            "stk.1d.x": InputSpec("stk", "1d", 1, calendar="stock_calendar"),
+            "idx.1d.y": InputSpec("idx", "1d", 1, calendar="index_calendar"),
+        },
+    )
+    request = _request(
+        common_inputs="x = source('stk.1d.x')\ny = source('idx.1d.y')",
+        formula="factor = x + y",
+        target_freq="1d",
+        target_step_count=1,
+        asset_scope={"stk": "all", "idx": "all"},
+    )
+
+    result = BatchFactorEngine(provider).compute(request)
+
+    np.testing.assert_array_equal(result.arrays["alpha"], values * 2)
+
+
+def test_non_singleton_asset_dimensions_fail_with_source_diagnostics() -> None:
+    """验证 N 不可广播时报告资产类型和物理长度，但不把类型当规则。"""
+
+    provider = MemoryDataProvider(
+        dates=DATES,
+        asset_codes={"stk": [11, 22], "cb": [101, 102, 103]},
+        data={
+            "stk.1d.x": np.ones((2, 2, 1)),
+            "cb.1d.y": np.ones((2, 3, 1)),
+        },
+    )
+    request = _request(
+        common_inputs="x = source('stk.1d.x')\ny = source('cb.1d.y')",
+        formula="factor = x + y",
+        target_freq="1d",
+        target_step_count=1,
+        asset_scope={"stk": "all", "cb": "all"},
+    )
+
+    with pytest.raises(
+        DomainError,
+        match=r"stk\(N=2\) cannot broadcast with cb\(N=3\)",
+    ):
         BatchFactorEngine(provider).compile(request)
+
+    assert provider.load_calls == []
+
+
+def test_slice_step_layout_uses_python_slice_length() -> None:
+    """验证 slice_step 只改变 ArrayLayout 的 S。"""
+
+    values = np.ones((2, 3, 4))
+    provider = MemoryDataProvider(
+        dates=DATES,
+        asset_codes={"stk": STOCKS},
+        data={"stk.1d.x": values},
+        input_specs={"stk.1d.x": InputSpec("stk", "1d", 4)},
+    )
+    job = BatchFactorEngine(provider).compile(
+        _request(
+            common_inputs="x = source('stk.1d.x')",
+            formula="factor = slice_step(x, start=1, end=3)",
+            target_freq="1d",
+            target_step_count=2,
+        )
+    )
+
+    term = job.plan.terms[job.plan.outputs["alpha"]]
+    assert term.layout.asset_count == 3
+    assert term.layout.step_count == 2
 
 
 def test_coarse_source_is_not_implicitly_aligned_to_fine_output() -> None:
@@ -148,7 +226,7 @@ def test_coarse_source_is_not_implicitly_aligned_to_fine_output() -> None:
         target_step_count=8,
     )
 
-    with pytest.raises(DomainError, match="align it explicitly"):
+    with pytest.raises(DomainError, match="step count 4 cannot broadcast"):
         BatchFactorEngine(provider).compile(request)
 
     assert provider.load_calls == []
@@ -235,8 +313,8 @@ def test_asset_selection_is_a_singleton_view_and_broadcasts_later() -> None:
         for term in result.plan.terms.values()
         if isinstance(term, OperatorTerm) and term.operator_name == "select_by_pos"
     )
-    assert selected_term.domain is not None
-    assert selected_term.domain.codes == (22,)
+    assert selected_term.layout.asset_count == 1
+    assert selected_term.layout.step_count == 2
     selected = select_by_pos(values, 1, axis=1, keepdims=True)
     assert selected.shape == (2, 1, 2)
     assert np.shares_memory(values, selected)
@@ -269,9 +347,8 @@ def test_cross_section_reduce_stays_singleton_until_output_boundary() -> None:
         for term in stream.plan.terms.values()
         if isinstance(term, OperatorTerm) and term.operator_name == "cs_mean"
     )
-    assert reduce_term.domain is not None
-    assert reduce_term.domain.codes is None
-    assert reduce_term.domain.asset_count == 1
+    assert reduce_term.layout.asset_count == 1
+    assert reduce_term.layout.step_count == 1
 
 
 def test_member_reduce_returns_anonymous_singleton() -> None:
@@ -310,7 +387,7 @@ def test_member_reduce_returns_anonymous_singleton() -> None:
         for term in result.plan.terms.values()
         if isinstance(term, OperatorTerm) and term.operator_name == "member_mean"
     )
-    assert term.domain is not None and term.domain.codes is None
+    assert term.layout.asset_count == 1
 
 
 def test_group_codes_can_vary_by_step_and_return_the_full_asset_axis() -> None:
