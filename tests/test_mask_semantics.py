@@ -255,7 +255,7 @@ def test_batch_runtime_rejects_invalid_mask_source_values() -> None:
         ),
     )
 
-    with pytest.raises(DataProviderError, match="only 0.0, 1.0, or NaN"):
+    with pytest.raises(DataProviderError, match="outside 0/1"):
         BatchFactorEngine(provider).compute(request)
 
 
@@ -282,6 +282,33 @@ def test_batch_runtime_rejects_invalid_mask_operator_results() -> None:
     )
 
     with pytest.raises(RuntimeExecutionError, match="only 0.0, 1.0, or NaN"):
+        BatchFactorEngine(provider, operators=operators).compute(request)
+
+
+def test_batch_runtime_rejects_operator_result_with_wrong_layout() -> None:
+    """验证 Operator kernel 返回 shape 与编译期 ArrayLayout 不符时被拒绝。"""
+
+    provider = MemoryDataProvider(
+        dates=["20240102"],
+        asset_codes={"stk": [1, 2]},
+        data={"stk.1d.x": np.ones((1, 2, 1))},
+    )
+    request = ComputeRequest(
+        DomainSpec("20240102", "20240102", {"stk": "all"}, "stk", "1d", 1),
+        FormulaBatch.from_text(
+            common_inputs="x = source('stk.1d.x')",
+            formulas={"invalid": "factor = wrong_shape(x)"},
+        ),
+    )
+    operators = default_operator_registry()
+    operators["wrong_shape"] = OperatorSpec(
+        "wrong_shape",
+        lambda x: x[:, :1, :],
+        (ValueKind.NUMERIC,),
+        ValueKind.NUMERIC,
+    )
+
+    with pytest.raises(RuntimeExecutionError, match=r"expected \(1, 2, 1\)"):
         BatchFactorEngine(provider, operators=operators).compute(request)
 
 

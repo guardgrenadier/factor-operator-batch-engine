@@ -1,7 +1,7 @@
 """提供因子计算引擎的稳定公共接口。"""
 
 from .data_provider.smartquant import SmartQuantDataProvider
-from .domain import ValueKind
+from .domain import ArrayLayout, ValueKind
 from .execution import (
     BatchFactorEngine,
     BatchResult,
@@ -36,6 +36,7 @@ from .model import (
     ComputeRequest,
     DataProvider,
     DataProviderError,
+    DatasetSpec,
     DomainError,
     DomainSpec,
     ExecutionOptions,
@@ -44,19 +45,22 @@ from .model import (
     InputSpec,
     LiteralTerm,
     LogicalPlan,
+    NormalizedSourceBatch,
     OperatorTerm,
     ReadDomain,
+    RawBatch,
+    ReaderRequest,
     ResolvedOutputDomain,
     ResultChunk,
     SourceBinding,
     SourceSpec,
     SourceTerm,
-    TermDomain,
 )
 from .providers import MemoryDataProvider
 from .repository import RepositoryDataProvider, TemporaryFactorRepository
 
 __all__ = [
+    "ArrayLayout",
     "BatchFactorEngine",
     "BatchResult",
     "Binding",
@@ -66,6 +70,7 @@ __all__ = [
     "ComputeResult",
     "DataProvider",
     "DataProviderError",
+    "DatasetSpec",
     "DomainError",
     "DomainSpec",
     "ExecutionOptions",
@@ -84,7 +89,10 @@ __all__ = [
     "MemoryDataProvider",
     "OperatorExpr",
     "OperatorTerm",
+    "NormalizedSourceBatch",
+    "RawBatch",
     "ReadDomain",
+    "ReaderRequest",
     "RepositoryDataProvider",
     "ResolvedOutputDomain",
     "ResultChunk",
@@ -98,7 +106,6 @@ __all__ = [
     "SymbolBindingError",
     "SymbolRefExpr",
     "TemporaryFactorRepository",
-    "TermDomain",
     "ValueKind",
     "get_fund",
     "get_hf",

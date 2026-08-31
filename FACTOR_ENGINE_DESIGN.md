@@ -1,10 +1,11 @@
-/# 统一因子计算引擎设计
+# 统一因子计算引擎设计
 
-- 状态：第一版实现基线
-- 日期：2026-08-11
+- 状态：目标设计基线；按位置 ArrayLayout 改造待实现
+- 日期：2026-08-30
 - 适用范围：新的统一因子公式编译与计算引擎
 - 术语表：[CONTEXT.md](CONTEXT.md)
 - 设计讨论日志：[design.md](design.md)
+- 架构决策：[ADR-0001](docs/adr/0001-use-positional-array-layout-for-operators.md)
 
 ## 1. 文档地位
 
@@ -67,7 +68,8 @@ Compiler
   ├── SymbolBinder
   ├── HelperExpander
   ├── SourceDescriber
-  ├── DomainLowering
+  ├── OutputDomainResolver
+  ├── ArrayLayoutLowering
   ├── Canonicalizer / Validator
   ├── TermLowering / CSE
   └── LookbackAnalyzer
@@ -287,7 +289,7 @@ helper 必须在 Canonical AST 生成前完全展开。
 
 ### 7.3 Canonical AST
 
-完成名称绑定、helper 展开和 Domain Lowering 后，Canonical AST 只包含：
+完成名称绑定、helper 展开和必要的 ArrayLayout Lowering 后，Canonical AST 只包含：
 
 - `LiteralExpr`；
 - `SourceRefExpr`；
@@ -317,9 +319,9 @@ load_factor("alpha_001")
 2. `SymbolBinder`：按作用域和顺序解析 SymbolRefExpr，拒绝未知、前向和跨组引用。
 3. `HelperExpander`：把所有 HelperExpr 展开为 SourceRefExpr 和 OperatorExpr。
 4. `SourceDescriber`：通过 DataProvider.describe_many() 获得每个 SourceRef 的 InputSpec。
-5. `DomainResolver`：把 DomainSpec 解析为不可变 ResolvedOutputDomain；该步骤可以与前几步并行，但必须在 Domain Lowering 前完成。
-6. `DomainLowering`：校验 TermDomain，并把允许的跨资产、跨频率和广播语义展开为显式 OperatorExpr。
-7. `Canonicalizer / Validator`：规范化参数、校验 operator/value/domain 契约，生成 Canonical AST。
+5. `OutputDomainResolver`：把 DomainSpec 解析为不可变 ResolvedOutputDomain。
+6. `ArrayLayoutLowering`：只推导 Source 和 shape-changing operator 的结构维度；普通算子不比较业务坐标身份。
+7. `Canonicalizer / Validator`：规范化参数并校验 operator 参数、ValueKind 和 lookback 契约，生成 Canonical AST。
 8. `TermLowering / CSE`：生成 LiteralTerm、SourceTerm、OperatorTerm，并按结构身份合并公共节点。
 9. `LookbackAnalyzer`：计算每个 Term 和全部输出所需的有限日期 lookback。
 10. 构造多输出 LogicalPlan。
@@ -332,7 +334,7 @@ LogicalPlan 至少包含：
 
 - Term DAG；
 - formula ID 到输出 Term 的映射；
-- 每个 Term 的 ValueSpec 和 TermDomain；
+- 每个 Term 的 ValueSpec 和必要的 ArrayLayout；
 - SourceTerm 列表；
 - 拓扑顺序；
 - Term 消费者计数；
@@ -363,6 +365,13 @@ SourceBinding
   ├── SourceSpec：物理上去哪里读
   ├── ReadDomain：本次读什么范围
   └── LoadGroupKey：和哪些字段一起读
+        │ Reader.read
+        ▼
+RawBatch
+        │ LoadNormalizer
+        ▼
+NormalizedSourceBatch
+  “可以进入 Workspace 的权威 T × N × S 数组”
 ```
 
 InputSpec 是 SourceRefExpr 与物理 SourceSpec 之间的语义适配契约，用于解耦编译和取数。真正把某个 SourceTerm、SourceSpec 与本次 ReadDomain 关联起来的是 SourceBinding。
@@ -413,7 +422,8 @@ physical query parameters
 
 ### 9.5 DataProvider
 
-第一版只定义一个数据端口，不拆分 SourceCatalog、Resolver、Binder 和 Loader：
+第一版对 Engine 只定义一个 DataProvider 端口；Provider 内部把物理 Reader 与
+LoadNormalizer 分开：
 
 ```python
 class DataProvider:
@@ -431,15 +441,19 @@ class DataProvider:
 
 - `describe_many()` 为 Compiler 提供 source 的逻辑规格；
 - `bind_many()` 为当前物理分区解析 SourceSpec、ReadDomain 和 LoadGroupKey；
-- `load_many()` 批量读取并返回与绑定契约严格一致的数组。
+- `load_many()` 编排 Reader 和 LoadNormalizer，并返回与绑定契约严格一致的数组。
 
-DataProvider 必须：
+Reader 只负责物理 I/O 和返回 RawBatch。LoadNormalizer 是唯一负责以下工作的组件：
 
 - 将外部 bool、integer、NULL 和 sentinel 规范化为 Runtime 值协议；
 - 对齐到 SourceBinding 指定的 dates、codes 和 steps；
 - 返回完整 `T × N × S` 数组；
-- 校验 shape、dtype 和缺失值；
+- 校验 shape、dtype、Infinity、ValueKind 和缺失值；
 - 不执行资产投影、频率聚合或因子 operator。
+
+Runtime 信任 NormalizedSourceBatch，不再重复扫描 Source 数组。Reader Strategy 与
+RawBatch/LoadNormalizer 的详细契约见
+[`docs/Reader与Load规范化边界设计.md`](docs/Reader与Load规范化边界设计.md)。
 
 ### 9.6 LoadGroup
 
@@ -494,7 +508,7 @@ asset_scope={
 
 未来如果需要“请求区间内出现过的资产并集”，应增加明确的选择器，例如 `ActiveDuring(...)`，不改变 `"all"` 的含义。
 
-### 10.3 三类 Domain
+### 10.3 两类权威 Domain 与 ArrayLayout
 
 #### OutputDomain
 
@@ -510,24 +524,6 @@ calendar identity
 axis fingerprint
 ```
 
-#### TermDomain
-
-每个 Term 的计算空间：
-
-```text
-asset type
-asset codes / anonymous singleton / axis identity
-frequency
-step count
-calendar identity
-```
-
-完整资产轴保存稳定 codes；显式资产选择保存被选中的单个 code；截面
-reduce 使用匿名 singleton。首版仍只有一个 `TermDomain`，不引入第二套
-广播 Domain 类型。
-
-当前物理分区的日期数组由 ReadDomain 提供，不在每个 TermDomain 中重复复制。
-
 #### ReadDomain
 
 PhysicalPlanner 为某个分区生成的读取范围：
@@ -540,54 +536,65 @@ ResolvedOutputDomain reference
 
 输出范围和读取范围严格分离。单日输出可以因 rolling 或 delay 读取此前多日。
 
+#### ArrayLayout
+
+普通算子中间值不再具有权威坐标 Domain，只保留运行所需的结构布局：
+
+```text
+T：当前物理分区日期长度
+N：第二维长度
+S：第三维长度
+```
+
+ArrayLayout 不保存资产类型、代码顺序、calendar 或 axis fingerprint，也不承诺两个
+相同位置具有相同业务含义。Source 的原生资产、频率和 step 信息仍由 InputSpec 与
+SourceBinding 保存，用于取数和确需元数据的显式转换算子。
+
 ### 10.4 日期与日历
 
 第一版：
 
-- 由 `target_asset/target_freq` 通过 DomainCatalog 推导唯一交易日历；
-- 整个批次只使用一个兼容日历；
-- source 使用不兼容日历时编译失败；
-- `start/end` 解析为该日历上的有序输出 dates；
-- lookback 以交易 session 数计算；
-- 如果日历历史不足，读取可获得的最大前缀，rolling/min_periods 决定输出是否为 NaN，而不是伪造日期。
+- 由 `target_asset/target_freq` 通过 DomainCatalog 推导 OutputDomain 的唯一交易日历；
+- `start/end` 解析为该日历上的有序输出 dates，lookback 也按其 session 数计算；
+- SourceBinding 把每个 source 重建到共同 ReadDomain 日期轴，不存在的记录成为 Missing；
+- source 自身的 calendar 身份不参与普通算子兼容性检查；只有 Provider 无法把物理日期
+  映射到 ReadDomain 时才在 bind/load 边界失败；
+- 如果输出日历历史不足，读取可获得的最大前缀，rolling/min_periods 决定输出是否为 NaN，而不是伪造日期。
 
-## 11. Domain Lowering 与 NumPy 广播
+## 11. ArrayLayout 与 NumPy 广播
 
 ### 11.1 原则
 
-NumPy 只负责执行已经被 Compiler 证明语义正确的广播，不负责根据 shape 推断日期、资产和频率语义。
-
-即使两个数组 shape 相同，只要 dates、完整 codes 轴或 frequency 不兼容，也不能直接运算。首版不增加独立 step 身份对象：同 frequency 输入只按 step_count 的 NumPy 规则检查，基本面报告期等额外语义由数据契约和用户负责。
+普通 operator 只按位置处理 ndarray。Compiler 和 Runtime 不比较输入的资产类型、
+代码顺序、frequency、calendar 或 axis fingerprint；shape 相同即允许按位置计算，
+业务对齐正确性由公式作者和数据产品契约负责。
 
 ### 11.2 可以使用 NumPy 自动广播的情况
 
-1. scalar literal 与任意合法 Term 值；
-2. 已通过频率规则校验的 `T × N × 1` 到 `T × N × S` step 广播；
-3. 已经显式选择单一资产、指数或截面 reduce 后，`T × 1 × S` 到 `T × N × S` 资产广播；
-4. 最终 singleton 公式输出到请求资产数或 `target_step_count` 的广播。
+1. scalar literal 与任意数组；
+2. 日期维必须等于当前分区的 T，不允许用日期 singleton 猜测业务含义；
+3. N 和 S 分别只要求相等或一侧为 1；
+4. 最终输出的 N/S 也可以从 singleton 广播到 OutputDomain 请求的长度。
 
-Runtime 应优先依靠 NumPy broadcast view，避免为日频进入日内等场景复制完整数组。
+实现直接复用 `np.broadcast_shapes()` / `np.broadcast_to()`，不维护另一套手写广播算法。
 
 ### 11.3 对齐规则
 
-目标规则大体继承现有业务经验，但在新 Compiler 中必须显式、可解释：
+SourceTerm 仍保留 DataProvider 描述的原始 frequency 和 step_count，但普通算子不会据此
+拒绝输入。标准分钟频通常因 S 不同而自然无法广播；如果不同频率或不同业务 step
+恰好具有相同 S，则允许直接按位置计算。
 
-- SourceTerm 始终保留 DataProvider 描述的原始 frequency 和 step_count；
-- 同一完整资产轴、同频率：step 相同或一侧为 singleton 时直接运算；
-- 日频 singleton 与日频多 step 或分钟频输入：由 NumPy 直接广播，输出继承非 singleton 一侧；
-- 日频多 step 不能直接解释为分钟 step，必须先显式选择或聚合为 singleton；
-- 粗日内频率到细日内频率：必须显式调用 `align_frequency(..., method="ffill")`；
-- 细日内频率到粗频率或日频：必须显式声明 reducer/resample；
-- `resample` 只改变输入 Domain 的 frequency 和 step_count，必须保留 asset、codes、calendar 和 axis_fingerprint，不与任务 target 耦合；
-- 公开 `resample(expr, target_freq, method=...)` 与 `get_hf(..., resample=..., method=...)` 简写必须规范化为同一个 AST 和默认 Registry 算子；Provider 只加载原始频率 Source，Compiler 负责推导分组与输出 Domain，Runtime 执行该算子的唯一 kernel；
-- `stk → cb`：必须由业务 helper 显式表达并降低为通用关系映射；
-- `cb → stk`：可能多对一，必须显式声明 selector/reducer；
-- `idx → stk/cb`：必须先显式选择一个指数，再允许广播；
-- 无法唯一确定的资产或频率转换必须编译失败。
+改变物理 layout 的操作仍必须显式：
 
-delay、mask 和 PIT 政策是公式语义，必须由 helper 或公式显式产生，不由 NumPy 或 Runtime 自动猜测。
+- 粗日内到细日内使用 `align_frequency(..., method="ffill")`；
+- 细日内到粗频率或日频使用 `resample(..., method=...)`；
+- 资产选择、资产投影、step 选择和 reduce 使用对应显式 operator/helper；
+- shape-changing operator 只声明有限的 layout effect，例如保留、N 归约为 1、S 归约为 1；
+- `resample` 等需要源频率或坐标元数据的算子保留专属 lowering；当输入来源无法提供
+  唯一元数据时，调用方必须显式补充参数或编译失败。
 
-Compiler 不在普通 operator 前插入广播或频率转换节点。Runtime 和输出边界只执行已经由 Compiler 证明合法的 NumPy singleton 广播。
+这些显式操作用于得到需要的数组布局或业务结果，不构成普通算子输入必须同坐标的限制。
+delay、mask 和 PIT 政策仍必须由 helper 或公式显式产生。
 
 ### 11.4 指数与转债映射决策
 
@@ -601,7 +608,7 @@ Compiler 不在普通 operator 前插入广播或频率转换节点。Runtime �
 | 股票投影到转债 | helper 自动注入任务级关系 Source | `project_stk_to_cb` 降为 `lookup_by_col` | `T × N_cb × S` |
 
 指数两种操作不隐式生成 mapping，也不把 singleton 物理扩展到股票或转债轴；
-后续普通运算由 NumPy 广播，如果只希望保留指数成分，公式显式使用 mask。
+后续普通运算由 NumPy 按 shape 广播，如果只希望保留指数成分，公式显式使用 mask。
 股票到转债必须将原始正股 InnerCode 换成当前任务股票轴上的位置，
 该位置列由任务级 Provider 生成，其他层不猜测或缓存跨任务列号。
 
@@ -632,7 +639,9 @@ code
 - 普通非 literal Term 的 shape 为 `T × N × S`；
 - literal 可以是 scalar，由 NumPy 在通过语义校验后广播。
 
-Mask 的有限值只允许 `0.0` 和 `1.0`；Source 或 operator 返回其他有限值或无穷值时必须明确失败，不能按 Python/NumPy truthy 规则解释。
+ValueKind 只描述有限值的逻辑集合，不负责执行数组转换。Source Load 规范化边界先把
+正负 Infinity 转换为 NaN，再校验 MASK 的 `0/1/NaN` 和 CODE 的整数/NaN。内置
+operator kernel 必须保证不返回 Infinity；Runtime 不再为每个中间 Term 重复全数组扫描。
 
 ### 12.2 缺失和三值逻辑
 
@@ -644,7 +653,7 @@ Mask 的有限值只允许 `0.0` 和 `1.0`；Source 或 operator 返回其他有
 - `apply_mask(x, mask)` 只在 mask 为 True 时保留输入，False 或 Missing 均输出 Missing；
 - 截面 `sample_mask` 的 Missing 不参与统计样本，按 False 的选择语义处理；输出位置是否保留由各截面算子对 False sample 的既有契约决定，不因 Missing 另行传播；
 - `member_*` 的成员 mask 为 Missing 时按非成员处理；
-- 数值算子产生的非法或非有限结果统一规范化为 NaN。
+- 数值算子产生的非法或非有限结果由 kernel 直接写为 NaN；最终输出边界保留一次兜底规范化。
 
 ## 13. Operator 协议
 
@@ -656,12 +665,14 @@ func
 input_kinds
 output_kind
 date_lookback
+layout_effect
 ```
 
 - `input_kinds` 同时表达输入数量与 ValueKind；
 - `output_kind` 是固定 ValueKind 或继承指定输入；
 - `date_lookback` 是非负整数或只依赖编译期字面量参数的纯函数；
-- domain 变换由 Domain Lowering 决定，不由 OperatorSpec 通用推断；
+- `layout_effect` 只允许有限的结构变化（保持、N 归约、S 归约等），不接收或比较业务坐标；
+- `resample`、频率对齐和资产选择等确需元数据的算子使用专属 lowering；
 - 参数先通过 Python 函数签名排除未知或缺失参数，业务范围由算子自己校验。
 
 第一版注册的 operator 必须：
@@ -687,7 +698,7 @@ Term
 ```
 
 - LiteralTerm：公式操作数中的小型不可变字面量；
-- SourceTerm：带 SourceRef、InputSpec 和 TermDomain 的外部逻辑输入；
+- SourceTerm：带 SourceRef 和 InputSpec 的外部逻辑输入；
 - OperatorTerm：调用 OperatorSpec，并引用其他 Term。
 
 SymbolRef、helper、绑定名称和物理 SourceSpec 都不会成为 Term。
@@ -701,11 +712,11 @@ LiteralTerm:
   normalized literal + ValueSpec
 
 SourceTerm:
-  SourceRef semantic identity + InputSpec + TermDomain
+  SourceRef semantic identity + InputSpec + Source ArrayLayout
 
 OperatorTerm:
   operator name + dependency term ids
-  + normalized params + output ValueSpec + TermDomain
+  + normalized params + output ValueSpec
 ```
 
 以下内容不参与身份：
@@ -776,7 +787,7 @@ Runtime 接收已经完成 source binding 的 PhysicalPlan 分区，不再编译
 2. 遇到 SourceTerm 时，通过其 LoadGroup 调用 DataProvider.load_many()；
 3. LiteralTerm 直接产生标量；
 4. OperatorTerm 从 Workspace 取依赖并调用 OperatorSpec.func；
-5. 校验输出 dtype、shape、ValueKind 和 TermDomain；
+5. 信任内置 operator 契约，不执行逐 Term 业务坐标或全数组重复校验；
 6. 依赖的剩余消费者计数递减；
 7. 某个非输出 Term 不再被任何节点引用时，从 Workspace 删除；
 8. 公式输出节点就绪后生成 ResultChunk；
@@ -930,8 +941,8 @@ ResultAssemblyError
 多组顺序公式
 Literal/Source/Operator AST
 SymbolBinder 和 helper 展开
-同资产、同频率 Domain
-scalar/singleton step 广播
+Source/Output/Read Domain
+按位置 ArrayLayout 与 NumPy singleton 广播
 float64 + NaN
 内存 DataProvider
 Term DAG、CSE、拓扑执行
@@ -953,11 +964,11 @@ ResultStream、ComputeResult、DataFrame
 - 实现作用域和 SymbolBinder；
 - 固定 source span 诊断。
 
-### M1：同域 Compiler 与 Term DAG
+### M1：Compiler 与 Term DAG
 
 - helper 展开；
 - 内存 DataProvider.describe_many()；
-- ResolvedOutputDomain 和同域 TermDomain；
+- ResolvedOutputDomain 和 Source ArrayLayout；
 - Canonical AST；
 - Term Lowering、结构身份和 CSE；
 - lookback 分析。
@@ -984,7 +995,7 @@ ResultStream、ComputeResult、DataFrame
 - 同表多字段 load_many()；
 - 坐标、dtype、shape 和 missing 校验。
 
-### M5：Domain Lowering
+### M5：显式 Layout 转换
 
 - 日频到日内 singleton step 广播；
 - 频率投影和显式 resample；
@@ -1012,7 +1023,7 @@ ResultStream、ComputeResult、DataFrame
 8. 相同 LoadGroup 的多个字段通过一次 load_many() 读取。
 9. provider 返回错序 codes、错误 shape 或错误 dtype 时被拒绝。
 10. NumPy singleton 广播不产生不必要的完整复制。
-11. shape 相同但坐标身份不同的 Term 不能直接计算。
+11. shape 相同但坐标身份不同的普通 Term 按位置计算；测试必须明确锁定这一契约。
 12. Workspace 在最后一个消费者结束后释放非输出 Term。
 13. ResultChunk shape 与 OutputDomain slice 一致。
 14. ResultStream 后续失败时，先前 chunk 不被视为已提交结果。

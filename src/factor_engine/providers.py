@@ -17,11 +17,13 @@ from .model import (
     DataProviderError,
     DomainError,
     InputSpec,
+    NormalizedSourceBatch,
     ReadDomain,
     SourceBinding,
     SourceSpec,
     SourceTerm,
 )
+from .data_provider.normalize import normalize_source_arrays
 
 
 class MemoryDataProvider:
@@ -96,12 +98,13 @@ class MemoryDataProvider:
             source_spec = SourceSpec.from_key(
                 key, source="memory", field=feature_key.name
             )
-            assert term.domain is not None and term.domain.codes is not None
+            domain = term.source_domain
+            assert domain.codes is not None
             term_domain = ReadDomain(
                 read_domain.dates,
                 read_domain.write_dates,
-                term.domain.codes,
-                tuple(get_step_values(term.domain.frequency, term.domain.step_count)),
+                domain.codes,
+                tuple(get_step_values(domain.frequency, domain.step_count)),
                 read_domain.output_slice,
             )
             # 依据加载组配置与读取坐标生成稳定的加载组键。
@@ -122,7 +125,7 @@ class MemoryDataProvider:
             )
         return bindings
 
-    def load_many(self, bindings: Sequence[SourceBinding]) -> Mapping[str, np.ndarray]:
+    def load_many(self, bindings: Sequence[SourceBinding]) -> NormalizedSourceBatch:
         """按物理绑定从内存数据批量切片加载数组。"""
         # 记录本次加载调用并建立日期与代码的位置索引。
         self.load_calls.append(tuple(binding.term_id for binding in bindings))
@@ -142,13 +145,13 @@ class MemoryDataProvider:
                 raise DataProviderError(
                     f"Source {binding.source_spec.key!r} lacks coordinate {exc.args[0]!r}"
                 ) from exc
-            # 按读取域切片并统一转换为 float64。
+            # 按读取域切片；统一值协议在 Provider 的 Source Load 边界完成。
             data = self._data[binding.source_spec.key]
-            loaded[binding.term_id] = np.asarray(
-                data[np.ix_(date_index, code_index, range(data.shape[2]))],
-                dtype=np.float64,
-            )
-        return loaded
+            loaded[binding.term_id] = data[
+                np.ix_(date_index, code_index, range(data.shape[2]))
+            ]
+        # 内存数据已经按最终坐标排列，只复用稠密数组的统一 Source 值协议。
+        return normalize_source_arrays(bindings, loaded)
 
 
 def _as_3d(value: Any) -> np.ndarray:

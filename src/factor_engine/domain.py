@@ -21,6 +21,15 @@ class ValueKind(str, Enum):
     CODE = "code"
 
 
+@dataclass(frozen=True)
+class ArrayLayout:
+    """普通 Term 的纯物理数组布局，不包含任何业务坐标身份。"""
+
+    scalar: bool
+    asset_count: int = 1
+    step_count: int = 1
+
+
 def as_tristate_mask(value: Any, *, name: str = "mask") -> np.ndarray:
     """按 0.0/1.0/NaN 协议规范化并校验三值 mask。"""
     array = np.asarray(value, dtype=np.float64)

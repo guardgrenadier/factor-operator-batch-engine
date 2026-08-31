@@ -1,4 +1,4 @@
-"""数据集目录（Catalog）：加载配置、描述与绑定逻辑数据源。"""
+"""数据集目录：发现字段并把逻辑 Source 绑定到 DatasetSpec。"""
 
 from __future__ import annotations
 
@@ -8,12 +8,13 @@ from typing import Any, Callable, Mapping
 
 from ..domain import ValueKind, get_freq_step_count, parse_feature_key, stable_hash
 from ..formula import SourceRefExpr
-from ..model import DataProviderError, InputSpec, SourceSpec
+from ..model import DataProviderError, DatasetSpec, InputSpec, SourceSpec
 from .backend import DuckDBBackend, column, measured_query, sql_literal
+from .datasets import READER_REGISTRY, SQL_QUERY_BUILDERS, minute_path
 
 
 class Catalog:
-    """一次任务使用的数据集目录；内部结构刻意保持为普通字典。"""
+    """一次任务使用的 DatasetSpec、逻辑 Source 和资产轴目录。"""
 
     def __init__(
         self,
@@ -22,23 +23,36 @@ class Catalog:
         config: Mapping[str, Any] | str | Path | None,
         emit: Callable[..., None],
     ) -> None:
-        """加载配置并构建数据集、逻辑 source 与资产轴数据集索引。"""
+        """加载配置，并冻结本次 Provider 使用的数据集与逻辑 Source 目录。"""
 
         payload = load_config(config)
-        if int(payload.get("schema_version", 0)) != 2:
-            raise DataProviderError("data_sources.json schema_version must be 2")
+        if int(payload.get("schema_version", 0)) != 3:
+            raise DataProviderError("data_sources.json schema_version must be 3")
 
         self.backend = backend
         self.duckdb = duckdb
         self.emit = emit
-        # datasets[id] 是物理表；sources[逻辑 key] 是这个字段的物理落点。
-        # sources 使用列表，只因为基本面允许同名 ItemName 用 data_code 消歧。
-        self.datasets: dict[str, dict[str, Any]] = {}
+        self.datasets: dict[str, DatasetSpec] = {}
         self.sources: dict[str, list[dict[str, Any]]] = {}
-        self.asset_datasets: dict[str, dict[str, Any]] = {}
+        self.asset_datasets: dict[str, DatasetSpec] = {}
 
-        for record in payload.get("source_tables", ()):
-            dataset = self._add_dataset(record)
+        # 先完整登记 Dataset，再校验跨 Dataset 依赖，避免配置顺序影响解析结果。
+        records = tuple(payload.get("datasets", ()))
+        for record in records:
+            self._add_dataset(record)
+        for dataset in self.datasets.values():
+            self._validate_dataset(dataset)
+
+        # 字段发现只扩展 Catalog；发现使用的元数据不会传入 Reader 参数。
+        for record in records:
+            dataset = self.datasets[str(record["dataset_id"])]
+            discover = record.get(
+                "discover_fields",
+                dataset.reader == "parquet_bars"
+                or dataset.query_builder == "panel_fields",
+            )
+            if not discover:
+                continue
             fields = tuple(record.get("fields", ()))
             if not fields:
                 try:
@@ -46,30 +60,68 @@ class Catalog:
                 except FileNotFoundError as exc:
                     emit(
                         operation="catalog",
-                        dataset=dataset["table"],
+                        dataset=str(dataset.params.get("table", dataset.dataset_id)),
                         status="unavailable",
                         error=type(exc).__name__,
                         physical_queries=0,
                     )
             ignored = DEFAULT_EXCLUDES | set(record.get("exclude_fields", ()))
+            ignored.update(
+                str(record[name])
+                for name in (
+                    "date_col",
+                    "code_col",
+                    "trading_flag_col",
+                )
+                if record.get(name)
+            )
             for field in fields:
                 name = str(field)
                 if name and not name.startswith("_") and name not in ignored:
                     self._add_source(
-                        f"{dataset['asset']}.{dataset['frequency']}.{name}",
-                        dataset["id"],
-                        name,
-                        SCANNED_FIELD_KINDS.get(name, "numeric"),
+                        f"{dataset.asset}.{dataset.frequency}.{name}",
+                        dataset.dataset_id,
+                        field=name,
+                        kind=SCANNED_FIELD_KINDS.get(name, "numeric"),
                     )
 
+        # Fundamental ItemCode 使用专属 expander，显式 Source 最后注册并可覆盖扫描结果。
         self._add_fundamentals()
-
         for key, record in payload.get("sources", {}).items():
-            dataset = self._add_dataset(record)
+            dataset_id = str(record["dataset_id"])
+            if dataset_id not in self.datasets:
+                raise DataProviderError(
+                    f"Source {key!r} references unknown dataset {dataset_id!r}"
+                )
+            parsed = parse_feature_key(str(key))
+            dataset = self.datasets[dataset_id]
+            if (parsed.asset, parsed.freq) != (dataset.asset, dataset.frequency):
+                raise DataProviderError(
+                    f"Source {key!r} does not match dataset {dataset_id!r} domain"
+                )
+            has_field, has_constant = "field" in record, "constant" in record
+            if dataset.query_builder == "panel_fields" and has_field == has_constant:
+                raise DataProviderError(
+                    f"SQL panel source {key!r} requires exactly one field or constant"
+                )
+            if dataset.reader in {"parquet_bars", "fundamental"} and not has_field:
+                raise DataProviderError(
+                    f"Source {key!r} requires one physical field"
+                )
+            if dataset.reader == "cb_stock_map" and record.get("projection") not in {
+                "inner_code",
+                "axis_position",
+            }:
+                raise DataProviderError(
+                    f"CB stock map source {key!r} has invalid projection"
+                )
             self.sources[str(key)] = [
                 {
-                    "dataset": dataset["id"],
-                    "field": str(record["field"]),
+                    "dataset": dataset_id,
+                    "field": record.get("field"),
+                    "constant": record.get("constant"),
+                    "projection": record.get("projection"),
+                    "default": record.get("default", float("nan")),
                     "kind": str(record.get("value_kind", "numeric")).lower(),
                     "params": dict(record.get("params", {})),
                 }
@@ -79,64 +131,56 @@ class Catalog:
 
     @property
     def source_count(self) -> int:
-        """目录中逻辑 source 的总数（含同名消歧条目）。"""
+        """返回逻辑 Source 条目数，包含需要 data_code 消歧的同名项。"""
 
         return sum(len(items) for items in self.sources.values())
 
     def describe(self, ref: SourceRefExpr) -> InputSpec:
-        """根据数据源引用解析出供编译使用的语义输入规格。"""
+        """把逻辑 Source 引用描述为不含物理读取信息的编译期输入规格。"""
 
         source, dataset, params = self._resolve(ref)
         return InputSpec(
-            dataset["asset"],
-            dataset["frequency"],
-            int(params.get("quarters", get_freq_step_count(dataset["frequency"]))),
+            dataset.asset,
+            dataset.frequency,
+            int(params.get("quarters", get_freq_step_count(dataset.frequency))),
             ValueKind(source["kind"]),
             "cn_a_share",
         )
 
     def bind(self, ref: SourceRefExpr) -> tuple[SourceSpec, ValueKind]:
-        """将数据源引用绑定为物理源规格（落点表、字段与读取参数）。"""
+        """把逻辑 Source 引用绑定到 Dataset、字段和 Reader 所需参数。"""
 
         source, dataset, params = self._resolve(ref)
         key = parse_feature_key(ref.logical_key)
-        field = (
-            str(params["column_name"])
-            if dataset["source"] == "Fundamental"
-            else source["field"]
-        )
+        field = params.get("column_name", source.get("field"))
         spec = SourceSpec(
             key.asset,
             key.freq,
             key.name,
-            dataset["source"],
-            dataset["table"],
-            field,
-            {
-                "dataset_id": dataset["id"],
-                "date_col": dataset["date_col"],
-                "date_col_type": dataset["date_col_type"],
-                "code_col": dataset["code_col"],
-                "duckdb_threads": dataset["duckdb_threads"],
-                "trading_flag_col": dataset["trading_flag_col"],
-                "path_template": dataset["path_template"],
-                "data_type": dataset["data_type"],
-                **params,
-            },
+            source=dataset.reader,
+            table=dataset.params.get("table"),
+            field=None if field is None else str(field),
+            params=params,
+            dataset_id=dataset.dataset_id,
+            constant=source.get("constant"),
+            default=source.get("default", float("nan")),
+            projection=source.get("projection"),
         )
         return spec, ValueKind(source["kind"])
 
-    def _resolve(self, ref: SourceRefExpr):
-        """按逻辑 key 与 data_code 消歧，选出唯一 source、数据集与参数。"""
+    def _resolve(
+        self, ref: SourceRefExpr
+    ) -> tuple[dict[str, Any], DatasetSpec, dict[str, Any]]:
+        """按逻辑 key 和可选 data_code 解析唯一 Source、Dataset 与合并参数。"""
 
         candidates = list(self.sources.get(ref.logical_key, ()))
-        params = dict(ref.semantic_params)
-        if "data_code" in params:
+        semantic_params = dict(ref.semantic_params)
+        if "data_code" in semantic_params:
             candidates = [
                 source
                 for source in candidates
                 if int(source["params"].get("data_code", -1))
-                == int(params["data_code"])
+                == int(semantic_params["data_code"])
             ]
         if not candidates:
             raise DataProviderError(f"Unknown source {ref.logical_key!r}")
@@ -149,53 +193,135 @@ class Catalog:
         return (
             source,
             self.datasets[source["dataset"]],
-            {**source["params"], **params},
+            {**source["params"], **semantic_params},
         )
 
-    def _add_dataset(self, record: Mapping[str, Any]) -> dict[str, Any]:
-        """登记一个物理数据集，推导 id 与坐标列名并记录资产轴数据集。"""
+    def _add_dataset(self, record: Mapping[str, Any]) -> DatasetSpec:
+        """从配置登记 DatasetSpec，并记录可提供任务资产轴的数据集。"""
 
-        source = str(record["source"])
-        asset = str(record["asset"])
-        frequency = str(record["freq"])
-        table = str(record["table"])
-        dataset_id = str(
-            record.get("dataset_id")
-            or stable_hash(source, asset, frequency, table)[:16]
-        )
-        dataset = {
-            "id": dataset_id,
-            "asset": asset,
-            "frequency": frequency,
-            "source": source,
-            "table": table,
-            "date_col": str(
-                record.get("date_col")
-                or ("TradingDay" if source == "IndexQuote" else "DataDate")
-            ),
-            "code_col": str(record.get("code_col") or "InnerCode"),
-            "trading_flag_col": record.get("trading_flag_col"),
-            "path_template": record.get("path_template"),
-            "data_type": record.get("data_type"),
-            "date_col_type": str(record.get("date_col_type", "date")),
-            "duckdb_threads": int(record.get("duckdb_threads", 8)),
+        try:
+            dataset_id = str(record["dataset_id"])
+            reader = str(record["reader"])
+            asset = str(record["asset"])
+            frequency = str(record["freq"])
+            query_builder = record.get("query_builder")
+        except KeyError as exc:
+            raise DataProviderError(f"Dataset is missing {exc.args[0]!r}") from exc
+        if reader not in READER_REGISTRY:
+            raise DataProviderError(f"Unknown reader {reader!r} for dataset {dataset_id!r}")
+        # Catalog 元数据不属于物理读取契约，不放入 DatasetSpec.params。
+        params = {
+            str(key): value
+            for key, value in record.items()
+            if key
+            not in {
+                "dataset_id",
+                "reader",
+                "query_builder",
+                "asset",
+                "freq",
+                "asset_axis",
+                "discover_fields",
+                "fields",
+                "exclude_fields",
+                "sample_date",
+            }
         }
-        self.datasets.setdefault(dataset_id, dataset)
+        dataset = DatasetSpec(
+            dataset_id,
+            reader,
+            asset,
+            frequency,
+            params,
+            None if query_builder is None else str(query_builder),
+        )
+        existing = self.datasets.get(dataset_id)
+        if existing is not None and existing != dataset:
+            raise DataProviderError(f"Duplicate dataset_id {dataset_id!r}")
+        self.datasets[dataset_id] = dataset
         if record.get("asset_axis"):
             self.asset_datasets[asset] = dataset
         return dataset
+
+    def _validate_dataset(self, dataset: DatasetSpec) -> None:
+        """在 Catalog 冻结前校验 Reader 最小配置和 Dataset 依赖。"""
+
+        params = dataset.params
+        required = {
+            "sql_reader": (),
+            "parquet_bars": (
+                "path_template",
+                "code_map",
+            ),
+            "fundamental": (
+                "table",
+                "date_col",
+                "code_col",
+                "rank_col",
+                "report_date_col",
+                "publication_date_col",
+            ),
+            "cb_stock_map": ("bond_code_table", "relation_table"),
+        }[dataset.reader]
+        if dataset.reader != "sql_reader" and dataset.query_builder is not None:
+            raise DataProviderError(
+                f"Dataset {dataset.dataset_id!r} cannot set query_builder for "
+                f"reader {dataset.reader!r}"
+            )
+        if dataset.reader == "sql_reader":
+            if dataset.query_builder not in SQL_QUERY_BUILDERS:
+                raise DataProviderError(
+                    f"Dataset {dataset.dataset_id!r} has unknown query_builder "
+                    f"{dataset.query_builder!r}"
+                )
+            required = {
+                "panel_fields": ("table", "date_col", "code_col"),
+                "adjust_factor": ("anchor_dataset_id", "factor_table"),
+                "untradable": ("table", "date_col", "code_col"),
+            }[dataset.query_builder]
+        missing = [name for name in required if name not in params]
+        if missing:
+            raise DataProviderError(
+                f"Dataset {dataset.dataset_id!r} is missing config {missing}"
+            )
+        if dataset.query_builder == "adjust_factor":
+            dependency = str(params["anchor_dataset_id"])
+            if dependency not in self.datasets:
+                raise DataProviderError(
+                    f"Dataset {dataset.dataset_id!r} references unknown anchor {dependency!r}"
+                )
+        if dataset.reader == "parquet_bars":
+            code_map = params["code_map"]
+            mode = code_map.get("mode")
+            if mode == "static" and "table" not in code_map:
+                raise DataProviderError(
+                    f"Dataset {dataset.dataset_id!r} static code_map requires table"
+                )
+            if mode == "dated":
+                dependency = str(code_map.get("dataset_id", ""))
+                if dependency not in self.datasets:
+                    raise DataProviderError(
+                        f"Dataset {dataset.dataset_id!r} references unknown code_map dataset {dependency!r}"
+                    )
+            if mode not in {"static", "dated"}:
+                raise DataProviderError(
+                    f"Dataset {dataset.dataset_id!r} has invalid code_map mode {mode!r}"
+                )
 
     def _add_source(
         self,
         key: str,
         dataset: str,
-        field: str,
+        *,
+        field: str | None = None,
+        constant: Any | None = None,
+        projection: str | None = None,
+        default: Any = float("nan"),
         kind: str = "numeric",
         params: Mapping[str, Any] | None = None,
-        *,
         duplicate: bool = False,
     ) -> None:
-        """在指定逻辑 key 下追加一个 source 落点，除非允许否则拒绝重复。"""
+        """登记一个逻辑 Source 落点，并按需允许 Fundamental 同名项。"""
 
         items = self.sources.setdefault(key, [])
         if items and not duplicate:
@@ -204,22 +330,26 @@ class Catalog:
             {
                 "dataset": dataset,
                 "field": field,
+                "constant": constant,
+                "projection": projection,
+                "default": default,
                 "kind": kind,
                 "params": dict(params or {}),
             }
         )
 
     def _scan_fields(
-        self, dataset: Mapping[str, Any], record: Mapping[str, Any]
+        self, dataset: DatasetSpec, record: Mapping[str, Any]
     ) -> tuple[str, ...]:
-        """扫描物理数据集的真实字段清单（分钟 parquet 或 SQL 列）。"""
+        """从样本 parquet 或 SQL information_schema 发现数据集字段。"""
 
-        if dataset["source"] == "MinuteParquet":
+        if dataset.reader == "parquet_bars":
             sample = minute_path(dataset, record.get("sample_date", "2024-12-31"))
             if not sample.exists():
                 raise FileNotFoundError(sample)
             return self.duckdb.parquet_fields(sample)
-        schema, table = dataset["table"].split(".", 1)
+        table_name = str(dataset.params["table"])
+        schema, table = table_name.split(".", 1)
         sql = (
             "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
             f"WHERE TABLE_SCHEMA = {sql_literal(schema)} "
@@ -229,12 +359,12 @@ class Catalog:
             lambda: self.backend.query(sql),
             self.emit,
             operation="catalog",
-            dataset=dataset["table"],
+            dataset=table_name,
         )
         return tuple(str(value) for value in rows[column(rows, "COLUMN_NAME")])
 
     def _add_fundamentals(self) -> None:
-        """查询基本面 Item 清单，为每个 Item 注册数据集与逻辑 source。"""
+        """发现 Fundamental ItemCode，并扩展对应 Dataset 与逻辑 Source。"""
 
         sql = (
             "SELECT c.ItemCode, c.ItemName "
@@ -256,21 +386,27 @@ class Catalog:
         for code, name in zip(rows[code_col], rows[name_col], strict=True):
             if name is None:
                 continue
+            data_code = int(code)
             dataset = self._add_dataset(
                 {
+                    "dataset_id": f"fundamental:{data_code}",
+                    "reader": "fundamental",
                     "asset": "stk",
                     "freq": "1d",
-                    "source": "Fundamental",
-                    "table": f"SmartQuant.Fundamental_Item{int(code)}",
-                    "dataset_id": f"fundamental:{int(code)}",
+                    "table": f"SmartQuant.Fundamental_Item{data_code}",
+                    "date_col": "DataDate",
+                    "code_col": "InnerCode",
+                    "rank_col": "EndDateRank",
+                    "report_date_col": "EndDate",
+                    "publication_date_col": "InfoPublDate",
                 }
             )
             self._add_source(
                 f"stk.1d.{name}",
-                dataset["id"],
-                "CumLatest",
+                dataset.dataset_id,
+                field="CumLatest",
                 params={
-                    "data_code": int(code),
+                    "data_code": data_code,
                     "column_name": "CumLatest",
                     "quarters": 1,
                     "publ_date_limit": -180,
@@ -280,7 +416,7 @@ class Catalog:
 
 
 def load_config(config: Mapping[str, Any] | str | Path | None) -> dict[str, Any]:
-    """读取 data_sources.json（可传字典、路径或默认内置文件）为配置字典。"""
+    """读取调用方配置、指定 JSON 文件或包内默认数据源配置。"""
 
     if isinstance(config, Mapping):
         return dict(config)
@@ -290,20 +426,6 @@ def load_config(config: Mapping[str, Any] | str | Path | None) -> dict[str, Any]
         else Path(__file__).with_name("data_sources.json")
     )
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def minute_path(dataset: Mapping[str, Any], date: Any) -> Path:
-    """按 path_template 与日期、data_type 渲染出单个分钟 parquet 文件路径。"""
-
-    template = dataset.get("path_template")
-    if not template:
-        raise DataProviderError(
-            f"Minute dataset {dataset['id']!r} has no path_template"
-        )
-    date_key = str(date).replace("-", "")[:8]
-    return Path(
-        str(template).format(date=date_key, data_type=dataset.get("data_type") or "")
-    )
 
 
 DEFAULT_EXCLUDES = {
@@ -341,3 +463,6 @@ SCANNED_FIELD_KINDS = {
     "IfSpecialTrade": "mask",
     "IfSuspended": "mask",
 }
+
+
+__all__ = ["Catalog"]
