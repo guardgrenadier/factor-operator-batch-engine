@@ -3,11 +3,6 @@
 正式架构和完整契约见 [`FACTOR_ENGINE_DESIGN.md`](FACTOR_ENGINE_DESIGN.md)。
 本文件只说明当前推荐入口。
 
-> 当前代码仍在从 `TermDomain/domain_rule` 迁移到普通算子按位置计算的
-> `ArrayLayout` 契约；本 README 中描述旧校验行为的部分代表当前实现，不代表
-> 已接受的目标设计。决策见
-> [`ADR-0001`](docs/adr/0001-use-positional-array-layout-for-operators.md)。
-
 ## 包结构
 
 ```text

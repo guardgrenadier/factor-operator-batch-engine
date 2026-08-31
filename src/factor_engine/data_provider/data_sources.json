@@ -1,159 +1,143 @@
 {
-  "schema_version": 3,
-  "datasets": [
+  "schema_version": 2,
+  "source_tables": [
     {
-      "dataset_id": "stk_return_daily",
-      "reader": "sql_reader",
-      "query_builder": "panel_fields",
       "asset": "stk",
       "freq": "1d",
+      "source": "ReturnDaily",
       "table": "SmartQuant.ReturnDaily",
+      "asset_axis": true,
       "date_col": "DataDate",
-      "code_col": "InnerCode",
-      "trading_flag_col": "IfTradingDay",
-      "asset_axis": true
+      "trading_flag_col": "IfTradingDay"
     },
     {
-      "dataset_id": "cb_return_daily",
-      "reader": "sql_reader",
-      "query_builder": "panel_fields",
       "asset": "cb",
       "freq": "1d",
+      "source": "CBReturnDaily",
       "table": "SmartQuant.CBReturnDaily",
+      "asset_axis": true,
       "date_col": "DataDate",
-      "code_col": "InnerCode",
-      "trading_flag_col": "IfTradingDay",
-      "asset_axis": true
+      "trading_flag_col": "IfTradingDay"
     },
     {
-      "dataset_id": "idx_quote",
-      "reader": "sql_reader",
-      "query_builder": "panel_fields",
       "asset": "idx",
       "freq": "1d",
+      "source": "IndexQuote",
       "table": "JYDB.QT_IndexQuote",
-      "date_col": "TradingDay",
-      "code_col": "InnerCode",
-      "asset_axis": true
+      "asset_axis": true,
+      "date_col": "TradingDay"
     },
     {
-      "dataset_id": "stk_1min",
-      "reader": "parquet_bars",
       "asset": "stk",
       "freq": "1min",
+      "source": "MinuteParquet",
+      "table": "/data/cephfs/minute/one_minute_stat/{date}.parquet",
+      "data_type": "one_minute_stat",
       "path_template": "/data/cephfs/minute/one_minute_stat/{date}.parquet",
-      "code_map": {
-        "mode": "static",
-        "table": "SmartQuant.InnerCode_SecuCode"
-      }
+      "sample_date": "2024-12-31",
+      "date_col": "trading_day",
+      "date_col_type": "date"
     },
     {
-      "dataset_id": "cb_1min",
-      "reader": "parquet_bars",
       "asset": "cb",
       "freq": "1min",
+      "source": "MinuteParquet",
+      "table": "/data/cephfs/cb_minute/one_minute_stat/{date}.parquet",
+      "data_type": "one_minute",
       "path_template": "/data/cephfs/cb_minute/one_minute_stat/{date}.parquet",
-      "code_map": {
-        "mode": "dated",
-        "dataset_id": "cb_return_daily"
-      }
+      "sample_date": "2024-12-31",
+      "date_col": "trading_day",
+      "date_col_type": "date"
     },
     {
-      "dataset_id": "stk_5min",
-      "reader": "parquet_bars",
       "asset": "stk",
       "freq": "5min",
+      "source": "MinuteParquet",
+      "table": "/data/cephfs/minute/five_minute/{date}.parquet",
+      "data_type": "five_minute",
       "path_template": "/data/cephfs/minute/five_minute/{date}.parquet",
-      "code_map": {
-        "mode": "static",
-        "table": "SmartQuant.InnerCode_SecuCode"
-      }
-    },
-    {
-      "dataset_id": "stk_adjust_factor",
-      "reader": "sql_reader",
-      "query_builder": "adjust_factor",
-      "asset": "stk",
-      "freq": "1d",
-      "anchor_dataset_id": "stk_return_daily",
-      "factor_table": "JYDB.DZ_AdjustingFactor"
-    },
-    {
-      "dataset_id": "stk_untradable",
-      "reader": "sql_reader",
-      "query_builder": "untradable",
-      "asset": "stk",
-      "freq": "1d",
-      "table": "SmartQuant.Untradable",
-      "date_col": "DataDate",
-      "code_col": "InnerCode"
-    },
-    {
-      "dataset_id": "cb_stock_map",
-      "reader": "cb_stock_map",
-      "asset": "cb",
-      "freq": "1d",
-      "bond_code_table": "JYDB.Bond_Code",
-      "relation_table": "JYDB.Bond_ConBDBasicInfo"
-    },
-    {
-      "dataset_id": "stk_index_component",
-      "reader": "sql_reader",
-      "query_builder": "panel_fields",
-      "asset": "stk",
-      "freq": "1d",
-      "table": "SmartQuant.IndexComponentWeight_Choice",
-      "date_col": "EndDate",
-      "code_col": "SecuInnerCode",
-      "selector": {
-        "param": "index_inner_code",
-        "column": "IndexInnerCode",
-        "type": "integer"
-      },
-      "discover_fields": false
+      "sample_date": "2024-12-31",
+      "date_col": "trading_day",
+      "date_col_type": "date"
     }
   ],
   "sources": {
     "stk.1d.adj_factor": {
-      "dataset_id": "stk_adjust_factor"
+      "asset": "stk",
+      "freq": "1d",
+      "name": "adj_factor",
+      "source": "AdjustFactor",
+      "table": "JYDB.DZ_AdjustingFactor",
+      "field": "adj_factor",
+      "params": {}
     },
     "stk.1d.is_untradable": {
-      "dataset_id": "stk_untradable",
+      "asset": "stk",
+      "freq": "1d",
+      "name": "is_untradable",
+      "source": "Untradable",
+      "table": "SmartQuant.Untradable",
+      "field": "is_untradable",
       "value_kind": "mask",
-      "default": 0
+      "params": {}
     },
     "cb.1d.underlying_stk_col": {
-      "dataset_id": "cb_stock_map",
-      "projection": "axis_position",
+      "asset": "cb",
+      "freq": "1d",
+      "name": "underlying_stk_col",
+      "source": "CBStockMap",
+      "table": "JYDB.Bond_ConBDBasicInfo",
+      "field": "StockInnerCode",
       "value_kind": "code",
       "params": {
-        "target_asset": "stk"
+        "kind": "col"
       }
     },
     "cb.1d.underlying_stk_inner_code": {
-      "dataset_id": "cb_stock_map",
-      "projection": "inner_code",
-      "value_kind": "code"
+      "asset": "cb",
+      "freq": "1d",
+      "name": "underlying_stk_inner_code",
+      "source": "CBStockMap",
+      "table": "JYDB.Bond_ConBDBasicInfo",
+      "field": "StockInnerCode",
+      "value_kind": "code",
+      "params": {
+        "kind": "inner_code"
+      }
     },
     "stk.1d.industry_code.SW2021.L1": {
-      "dataset_id": "stk_return_daily",
+      "asset": "stk",
+      "freq": "1d",
+      "name": "industry_code.SW2021.L1",
+      "source": "ReturnDaily",
+      "table": "SmartQuant.ReturnDaily",
       "field": "IndustryCodeNew",
-      "value_kind": "code"
+      "value_kind": "code",
+      "params": {}
     },
     "stk.1d.index_weight.CSI300": {
-      "dataset_id": "stk_index_component",
+      "asset": "stk",
+      "freq": "1d",
+      "name": "index_weight.CSI300",
+      "source": "IndexComponentWeight_Choice",
+      "table": "SmartQuant.IndexComponentWeight_Choice",
       "field": "Weight",
       "params": {
-        "index_inner_code": 3145
+        "index_inner_code": 3145,
+        "kind": "index_weight"
       }
     },
     "stk.1d.is_member.CSI300": {
-      "dataset_id": "stk_index_component",
-      "constant": 1,
-      "default": 0,
+      "asset": "stk",
+      "freq": "1d",
+      "name": "is_member.CSI300",
+      "source": "IndexComponentWeight_Choice",
+      "table": "SmartQuant.IndexComponentWeight_Choice",
+      "field": "Weight",
       "value_kind": "mask",
       "params": {
-        "index_inner_code": 3145
+        "index_inner_code": 3145,
+        "kind": "index_membership"
       }
     }
   }

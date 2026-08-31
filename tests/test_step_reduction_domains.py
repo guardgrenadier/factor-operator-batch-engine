@@ -90,7 +90,9 @@ def test_intraday_step_reductions_lower_to_daily_domain(
 
     assert isinstance(term, OperatorTerm)
     assert term.operator_name == operator
-    assert term.layout.step_count == 1
+    assert term.domain is not None
+    assert term.domain.frequency == "1d"
+    assert term.domain.step_count == 1
 
 
 def test_five_minute_step_reduction_lowers_to_daily_domain() -> None:
@@ -106,7 +108,9 @@ def test_five_minute_step_reduction_lowers_to_daily_domain() -> None:
 
     term = job.plan.terms[job.plan.outputs["alpha"]]
 
-    assert term.layout.step_count == 1
+    assert term.domain is not None
+    assert term.domain.frequency == "1d"
+    assert term.domain.step_count == 1
 
 
 def test_step_corr_merges_daily_singleton_before_lowering() -> None:
@@ -132,7 +136,9 @@ def test_step_corr_merges_daily_singleton_before_lowering() -> None:
     job = BatchFactorEngine(provider).compile(request)
     term = job.plan.terms[job.plan.outputs["alpha"]]
 
-    assert term.layout.step_count == 1
+    assert term.domain is not None
+    assert term.domain.frequency == "1d"
+    assert term.domain.step_count == 1
 
 
 def test_date_rolling_preserves_daily_step_reduction_domain() -> None:
@@ -150,7 +156,9 @@ def test_date_rolling_preserves_daily_step_reduction_domain() -> None:
 
     assert isinstance(term, OperatorTerm)
     assert term.operator_name == "ts_mean"
-    assert term.layout.step_count == 1
+    assert term.domain is not None
+    assert term.domain.frequency == "1d"
+    assert term.domain.step_count == 1
 
 
 def test_step_reduction_chain_compiles_and_executes_as_daily_factor() -> None:
@@ -172,7 +180,9 @@ def test_step_reduction_chain_compiles_and_executes_as_daily_factor() -> None:
 
     assert result.arrays["alpha"].shape == (len(DATES), len(CODES), 1)
     output = result.plan.terms[result.plan.outputs["alpha"]]
-    assert output.layout.step_count == 1
+    assert output.domain is not None
+    assert output.domain.frequency == "1d"
+    assert output.domain.step_count == 1
 
 
 def test_get_step_preserves_intraday_frequency() -> None:
@@ -188,7 +198,9 @@ def test_get_step_preserves_intraday_frequency() -> None:
 
     term = job.plan.terms[job.plan.outputs["alpha"]]
 
-    assert term.layout.step_count == 1
+    assert term.domain is not None
+    assert term.domain.frequency == "1min"
+    assert term.domain.step_count == 1
 
 
 def test_daily_step_reduction_broadcasts_to_intraday_target() -> None:
@@ -208,4 +220,6 @@ def test_daily_step_reduction_broadcasts_to_intraday_target() -> None:
         values, np.broadcast_to(values[:, :, :1], values.shape)
     )
     output = result.plan.terms[result.plan.outputs["alpha"]]
-    assert output.layout.step_count == 1
+    assert output.domain is not None
+    assert output.domain.frequency == "1d"
+    assert output.domain.step_count == 1

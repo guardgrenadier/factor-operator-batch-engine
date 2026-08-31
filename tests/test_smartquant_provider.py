@@ -17,7 +17,6 @@ from factor_engine import (
     ExecutionOptions,
     FormulaBatch,
     OperatorTerm,
-    RawBatch,
     ReadDomain,
     SmartQuantDataProvider,
     SourceBinding,
@@ -28,19 +27,16 @@ from factor_engine import (
 )
 from factor_engine.domain import get_freq_step_count, get_freq_step_values
 from factor_engine.data_provider.backend import DuckDBBackend, sql_literal_list
-from factor_engine.data_provider.normalize import LoadNormalizer
+from factor_engine.data_provider.normalize import scatter_positions, scatter_rows
 
 
 AXIS_SOURCE = {
-    "dataset_id": "stk_return_daily",
-    "reader": "sql_reader",
-    "query_builder": "panel_fields",
     "asset": "stk",
     "freq": "1d",
+    "source": "ReturnDaily",
     "table": "SmartQuant.ReturnDaily",
     "asset_axis": True,
     "date_col": "DataDate",
-    "code_col": "InnerCode",
     "trading_flag_col": "IfTradingDay",
     "fields": ["DataDate", "InnerCode", "SecuCode", "IfTradingDay"],
 }
@@ -194,15 +190,13 @@ class _MinuteReader:
 def _minute_source(template: str, fields: list[str]) -> dict[str, object]:
     """构造分钟级 parquet 分区的物理源规格配置。"""
     return {
-        "dataset_id": "stk_1min",
-        "reader": "parquet_bars",
         "asset": "stk",
         "freq": "1min",
+        "source": "MinuteParquet",
+        "table": template,
         "path_template": template,
-        "code_map": {
-            "mode": "static",
-            "table": "SmartQuant.InnerCode_SecuCode",
-        },
+        "date_col": "trading_day",
+        "date_col_type": "date",
         "fields": [
             "trading_day",
             "security_code",
@@ -245,26 +239,7 @@ def _legacy_minute_arrays(
         "INNER JOIN step_axis s ON p.start_time = s.start_time",
         tables={"code_map": legacy_map, "step_axis": step_axis},
     )
-    domain = bindings[0].read_domain
-    flat_idx = (
-        rows["date_idx"] * (len(domain.codes) * len(domain.steps))
-        + rows["asset_idx"] * len(domain.steps)
-        + rows["step_idx"]
-    )
-    return dict(
-        LoadNormalizer(bindings, "flat").normalize(
-            [
-                RawBatch(
-                    "flat",
-                    {"flat_idx": flat_idx},
-                    {
-                        binding.term_id: rows[aliases[binding.term_id]]
-                        for binding in bindings
-                    },
-                )
-            ]
-        )
-    )
+    return scatter_positions(bindings, rows, aliases)
 
 
 def _projection_provider() -> SmartQuantDataProvider:
@@ -272,8 +247,8 @@ def _projection_provider() -> SmartQuantDataProvider:
     return SmartQuantDataProvider(
         backend=_ProjectionReader(),
         source_config={
-            "schema_version": 3,
-            "datasets": [
+            "schema_version": 2,
+            "source_tables": [
                 {
                     **AXIS_SOURCE,
                     "fields": [
@@ -285,33 +260,25 @@ def _projection_provider() -> SmartQuantDataProvider:
                     ],
                 },
                 {
-                    "dataset_id": "cb_return_daily",
-                    "reader": "sql_reader",
-                    "query_builder": "panel_fields",
                     "asset": "cb",
                     "freq": "1d",
+                    "source": "CBReturnDaily",
                     "table": "SmartQuant.CBReturnDaily",
                     "asset_axis": True,
                     "date_col": "DataDate",
-                    "code_col": "InnerCode",
                     "trading_flag_col": "IfTradingDay",
                     "fields": ["DataDate", "InnerCode", "IfTradingDay"],
-                },
-                {
-                    "dataset_id": "cb_stock_map",
-                    "reader": "cb_stock_map",
-                    "asset": "cb",
-                    "freq": "1d",
-                    "bond_code_table": "JYDB.Bond_Code",
-                    "relation_table": "JYDB.Bond_ConBDBasicInfo",
                 },
             ],
             "sources": {
                 "cb.1d.underlying_stk_col": {
-                    "dataset_id": "cb_stock_map",
-                    "projection": "axis_position",
+                    "asset": "cb",
+                    "freq": "1d",
+                    "source": "CBStockMap",
+                    "table": "JYDB.Bond_ConBDBasicInfo",
+                    "field": "StockInnerCode",
                     "value_kind": "code",
-                    "params": {"target_asset": "stk"},
+                    "params": {"kind": "col"},
                 }
             },
         },
@@ -324,8 +291,8 @@ def test_task_domain_lookback_and_daily_fields_use_one_sql() -> None:
     provider = SmartQuantDataProvider(
         backend=reader,
         source_config={
-            "schema_version": 3,
-            "datasets": [
+            "schema_version": 2,
+            "source_tables": [
                 {
                     **AXIS_SOURCE,
                     "fields": [
@@ -376,8 +343,8 @@ def test_explicit_axis_is_validated_and_keeps_caller_order() -> None:
     provider = SmartQuantDataProvider(
         backend=reader,
         source_config={
-            "schema_version": 3,
-            "datasets": [AXIS_SOURCE],
+            "schema_version": 2,
+            "source_tables": [AXIS_SOURCE],
             "sources": {},
         },
     )
@@ -393,8 +360,8 @@ def test_wide_and_asset_axis_support_custom_code_col() -> None:
     provider = SmartQuantDataProvider(
         backend=reader,
         source_config={
-            "schema_version": 3,
-            "datasets": [
+            "schema_version": 2,
+            "source_tables": [
                 {
                     **AXIS_SOURCE,
                     "code_col": "SecurityCode",
@@ -505,8 +472,8 @@ def test_minute_fields_share_one_parquet_scan(tmp_path, monkeypatch) -> None:
         backend=reader,
         duckdb=duckdb,
         source_config={
-            "schema_version": 3,
-            "datasets": [
+            "schema_version": 2,
+            "source_tables": [
                 AXIS_SOURCE,
                 {
                     **_minute_source(template, ["close", "volume"]),
@@ -542,8 +509,8 @@ def test_minute_fields_share_one_parquet_scan(tmp_path, monkeypatch) -> None:
     assert "filename=true" in duckdb.minute_sql
     assert "trading_day" not in duckdb.minute_sql
     assert "CAST(p.security_code" not in duckdb.minute_sql
-    assert 'cast_to_type(m.SecuCode, p."security_code")' in duckdb.minute_sql
-    assert "AS DOUBLE" not in duckdb.minute_sql
+    assert "cast_to_type(m.SecuCode, p.security_code)" in duckdb.minute_sql
+    assert "AS DOUBLE" in duckdb.minute_sql
     assert "AS flat_idx" in duckdb.minute_sql
     assert "start_time IN" not in duckdb.minute_sql
     assert duckdb.code_map_columns == ["InnerCode", "SecuCode"]
@@ -554,7 +521,7 @@ def test_minute_fields_share_one_parquet_scan(tmp_path, monkeypatch) -> None:
     }
     assert duckdb.asset_axis == {"InnerCode": [101], "asset_idx": [0]}
     mapping_sql = next(sql for sql in reader.sql if "InnerCode_SecuCode" in sql)
-    assert "WHERE `InnerCode` IN (101)" in mapping_sql
+    assert "WHERE InnerCode IN (101)" in mapping_sql
     assert "DataDate" not in mapping_sql
 
 
@@ -581,29 +548,21 @@ def test_cb_minute_keeps_date_dependent_code_map(tmp_path) -> None:
     provider = SmartQuantDataProvider(
         backend=reader,
         source_config={
-            "schema_version": 3,
-            "datasets": [
+            "schema_version": 2,
+            "source_tables": [
                 {
-                    "dataset_id": "cb_return_daily",
-                    "reader": "sql_reader",
-                    "query_builder": "panel_fields",
                     "asset": "cb",
                     "freq": "1d",
+                    "source": "CBReturnDaily",
                     "table": "SmartQuant.CBReturnDaily",
                     "asset_axis": True,
                     "date_col": "DataDate",
-                    "code_col": "InnerCode",
                     "trading_flag_col": "IfTradingDay",
                     "fields": ["DataDate", "InnerCode", "SecuCode", "IfTradingDay"],
                 },
                 {
                     **_minute_source(template, ["close"]),
-                    "dataset_id": "cb_1min",
                     "asset": "cb",
-                    "code_map": {
-                        "mode": "dated",
-                        "dataset_id": "cb_return_daily",
-                    },
                 },
             ],
             "sources": {},
@@ -668,8 +627,8 @@ def test_minute_streaming_matches_shape_dtype_values_and_alignment(tmp_path) -> 
         backend=_MinuteReader(code_map),
         duckdb=DuckDBBackend(arrow_batch_rows=2),
         source_config={
-            "schema_version": 3,
-            "datasets": [
+            "schema_version": 2,
+            "source_tables": [
                 AXIS_SOURCE,
                 _minute_source(template, ["close", "volume"]),
             ],
@@ -778,8 +737,8 @@ def test_minute_streaming_rejects_duplicate_coordinates(
         backend=_MinuteReader(code_map),
         duckdb=DuckDBBackend(arrow_batch_rows=batch_rows),
         source_config={
-            "schema_version": 3,
-            "datasets": [
+            "schema_version": 2,
+            "source_tables": [
                 AXIS_SOURCE,
                 _minute_source(template, ["close"]),
             ],
@@ -808,8 +767,8 @@ def test_minute_streaming_rejects_duplicate_coordinates(
         BatchFactorEngine(provider).compute(request)
 
 
-def test_normalizer_applies_membership_default_to_missing_rows() -> None:
-    """验证规范化边界保留权重缺失并填充成员默认值。"""
+def test_scatter_uses_existing_value_column_and_membership_constant() -> None:
+    """验证逐行散点复用已有 value 列并填充成员常量。"""
     domain = ReadDomain(
         ("20240102",),
         ("20240102",),
@@ -819,34 +778,40 @@ def test_normalizer_applies_membership_default_to_missing_rows() -> None:
     )
     weight = SourceBinding(
         "weight",
-        SourceSpec("stk", "1d", "weight"),
+        SourceSpec("stk", "1d", "weight", params={"kind": "index_weight"}),
         domain,
         "index",
     )
     member = SourceBinding(
         "member",
         SourceSpec(
-            "stk", "1d", "member", default=0.0
+            "stk", "1d", "member", params={"kind": "index_membership"}
         ),
         domain,
         "index",
         ValueKind.MASK,
     )
-    result = LoadNormalizer((weight, member), "labels").normalize(
-        [
-            RawBatch(
-                "labels",
-                {"date": ["20240102"], "asset": [101]},
-                {"weight": [0.25], "member": [1.0]},
-            )
-        ]
+    rows = pd.DataFrame(
+        {
+            "DataDate": ["20240102"],
+            "InnerCode": [101],
+            "value": [0.25],
+        }
+    )
+
+    result = scatter_rows(
+        (weight, member),
+        rows,
+        {"weight": "value"},
+        constants={"member": 1.0},
+        defaults={"member": 0.0},
     )
 
     np.testing.assert_allclose(
         result["weight"][:, :, 0], [[0.25, np.nan]], equal_nan=True
     )
     np.testing.assert_array_equal(result["member"][:, :, 0], [[1.0, 0.0]])
-    assert not result["weight"].flags.writeable
+    assert rows.columns.tolist() == ["value"]
 
 
 def test_minute_group_fails_when_any_partition_file_is_missing(tmp_path) -> None:
@@ -863,11 +828,22 @@ def test_minute_group_fails_when_any_partition_file_is_missing(tmp_path) -> None
     provider = SmartQuantDataProvider(
         backend=_Reader(),
         source_config={
-            "schema_version": 3,
-            "datasets": [
+            "schema_version": 2,
+            "source_tables": [
                 AXIS_SOURCE,
                 {
-                    **_minute_source(template, ["close"]),
+                    "asset": "stk",
+                    "freq": "1min",
+                    "source": "MinuteParquet",
+                    "table": template,
+                    "path_template": template,
+                    "date_col": "trading_day",
+                    "fields": [
+                        "trading_day",
+                        "security_code",
+                        "start_time",
+                        "close",
+                    ],
                 },
             ],
             "sources": {},

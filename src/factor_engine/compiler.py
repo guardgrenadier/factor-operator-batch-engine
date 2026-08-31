@@ -11,7 +11,6 @@ from typing import Any, Iterator, Mapping, Sequence
 import numpy as np
 
 from .domain import (
-    ArrayLayout,
     ValueKind,
     get_ffill_step_index,
     get_freq_step_values,
@@ -46,10 +45,10 @@ from .model import (
     ResolvedOutputDomain,
     SourceTerm,
     Term,
-    SourceDomain,
+    TermDomain,
 )
 from .operators import OperatorSpec, VariadicInput, default_operator_registry
-from .operators.layout_rules import numpy_layout
+from .operators.domain_rules import numpy_domain
 
 
 class Compiler:
@@ -96,8 +95,7 @@ class Compiler:
         self._by_semantic_key: dict[str, str] = {}
         self._order: list[str] = []
         self._input_specs = input_specs
-        self._target_layout = ArrayLayout(False, len(domain.codes), len(domain.steps))
-        self._special_domains: dict[str, SourceDomain] = {}
+        self._target_domain = _term_domain(domain)
         lowered_outputs: dict[str, str] = {}
         for formula_id, expr in outputs.items():
             try:
@@ -106,7 +104,7 @@ class Compiler:
                 location = str(expr.span) if expr.span is not None else formula_id
                 raise type(exc)(f"{location}: formula {formula_id!r}: {exc}") from exc
         for formula_id, term_id in lowered_outputs.items():
-            self._validate_output_layout(formula_id, self._terms[term_id].layout)
+            self._validate_output_domain(formula_id, self._terms[term_id].domain)
         # 统计引用次数供执行期回收中间结果，并计算任务级回看长度。
         references = {term_id: 0 for term_id in self._terms}
         for term in self._terms.values():
@@ -146,22 +144,15 @@ class Compiler:
         lookback: int,
     ) -> ResolvedOutputDomain:
         """根据请求范围和输入描述解析不可变输出域。"""
-        # 目标资产必须在请求范围内；普通输入不要求共享业务日历。
+        # 目标资产必须在请求范围内，全部输入必须共用同一日历。
         if spec.target_asset not in spec.asset_scope:
             raise DomainError("target_asset must be present in asset_scope")
-        target_calendars = {
-            item.calendar
-            for item in input_specs
-            if item.asset_type == spec.target_asset
-        }
-        all_calendars = {item.calendar for item in input_specs}
-        calendar = (
-            next(iter(target_calendars))
-            if len(target_calendars) == 1
-            else next(iter(all_calendars))
-            if len(all_calendars) == 1
-            else "default"
-        )
+        calendars = {item.calendar for item in input_specs}
+        if len(calendars) > 1:
+            raise DomainError(
+                f"Sources use incompatible calendars: {sorted(calendars)}"
+            )
+        calendar = next(iter(calendars), "default")
         # 在提供者日历中裁剪闭区间日期，并按回看长度外扩成分解析窗口。
         all_dates = np.asarray(self.provider.calendar_dates(calendar))
         start, end = normalize_date_key(spec.start), normalize_date_key(spec.end)
@@ -357,9 +348,7 @@ class Compiler:
         semantic = stable_hash("literal", value, kind.value)
         return self._intern(
             semantic,
-            lambda term_id: LiteralTerm(
-                term_id, kind, ArrayLayout(True), 0, semantic, value
-            ),
+            lambda term_id: LiteralTerm(term_id, kind, None, 0, semantic, value),
         )
 
     def _lower_source(self, ref: SourceRefExpr) -> str:
@@ -373,7 +362,7 @@ class Compiler:
             raise DomainError(
                 f"Source {ref.logical_key!r} has an invalid Domain: {exc}"
             ) from exc
-        domain = SourceDomain(
+        domain = TermDomain(
             spec.asset_type,
             codes,
             spec.frequency,
@@ -381,12 +370,11 @@ class Compiler:
             spec.calendar,
             fingerprint,
         )
-        layout = ArrayLayout(False, len(codes), spec.step_count)
-        semantic = stable_hash("source", _source_identity(ref), spec)
+        semantic = stable_hash("source", _source_identity(ref), spec, domain)
         return self._intern(
             semantic,
             lambda term_id: SourceTerm(
-                term_id, spec.value_kind, layout, 0, semantic, ref, spec, domain
+                term_id, spec.value_kind, domain, 0, semantic, ref, spec
             ),
         )
 
@@ -399,31 +387,28 @@ class Compiler:
             return self._lower_align_frequency(expr)
         if expr.name == "__select_asset":
             return self._lower_select_asset(expr)
-        if expr.name == "lookup_by_col":
-            return self._lower_lookup_by_col(expr)
         try:
             spec = self.operators[expr.name]
         except KeyError as exc:
             raise CompileError(f"Unknown operator {expr.name!r}") from exc
-        # 规范调用参数，降低输入并依照算子契约推导纯物理布局。
+        # 规范调用参数，降低输入并依照算子契约推导输出领域。
         input_exprs, input_names, params = _canonical_call(expr, spec)
         input_ids = tuple(self._lower(arg) for arg in input_exprs)
         inputs = tuple(self._terms[term_id] for term_id in input_ids)
         _validate_operator(spec, inputs, input_names, params)
-        rule = spec.layout_rule or numpy_layout
-        try:
-            layout = rule(tuple(term.layout for term in inputs), params)
-        except DomainError as exc:
-            raise self._layout_error(exc, input_ids, inputs) from exc
+        rule = spec.domain_rule or numpy_domain
+        domain = rule(tuple(term.domain for term in inputs), params)
         params = dict(params)
         if spec.name == "get_step" and "step" in params:
-            params["step"] %= inputs[0].layout.step_count
+            assert inputs[0].domain is not None
+            params["step"] %= inputs[0].domain.step_count
         elif spec.name == "select_by_pos" and "pos" in params:
+            assert inputs[0].domain is not None
             axis = params.get("axis", 1)
             length = (
-                inputs[0].layout.asset_count
+                inputs[0].domain.asset_count
                 if axis == 1
-                else inputs[0].layout.step_count
+                else inputs[0].domain.step_count
             )
             params["pos"] %= length
         output_kind = _output_kind(spec, inputs)
@@ -436,14 +421,14 @@ class Compiler:
             tuple(zip(input_names, input_ids, strict=True)),
             params,
             output_kind.value,
-            layout,
+            domain,
         )
         return self._intern(
             semantic,
             lambda term_id: OperatorTerm(
                 term_id,
                 output_kind,
-                layout,
+                domain,
                 lookback,
                 semantic,
                 spec.name,
@@ -464,14 +449,13 @@ class Compiler:
         input_ids = tuple(self._lower(arg) for arg in input_exprs)
         inputs = tuple(self._terms[term_id] for term_id in input_ids)
         _validate_operator(spec, inputs, input_names, params)
-        if len(inputs) != 1 or inputs[0].layout.scalar:
+        if len(inputs) != 1 or inputs[0].domain is None:
             raise DomainError("Cannot resample a scalar")
         if "source_freq" in params:
             raise CompileError("resample does not accept source_freq")
         input_term = inputs[0]
-        input_domain = self._business_domain(input_ids[0])
-        if input_domain is None:
-            raise DomainError("resample requires one unambiguous Source domain")
+        input_domain = input_term.domain
+        assert input_domain is not None
         source_freq = input_domain.frequency
         target_freq = str(params["target_freq"])
         method = params.get("method")
@@ -487,13 +471,13 @@ class Compiler:
             )
         if source_freq == "1d":
             raise DomainError("resample cannot convert a daily input")
-        if input_term.layout.step_count != len(get_freq_step_values(source_freq)):
+        if input_domain.step_count != len(get_freq_step_values(source_freq)):
             raise DomainError(
                 "resample requires the complete standard source step axis"
             )
         # 按目标频率生成 step 分组边界作为运行期参数。
         if target_freq == "1d":
-            groups = np.zeros(input_term.layout.step_count, dtype=np.intp)
+            groups = np.zeros(input_domain.step_count, dtype=np.intp)
             step_count = 1
         else:
             try:
@@ -510,15 +494,11 @@ class Compiler:
             "boundaries": boundaries,
         }
         _validate_operator(spec, inputs, input_names, runtime_params)
-        output_domain = replace(
-            input_domain, frequency=target_freq, step_count=step_count
-        )
-        return self._explicit_operator(
+        return self._domain_operator(
             spec.name,
             input_ids[0],
             runtime_params,
-            ArrayLayout(False, input_term.layout.asset_count, step_count),
-            output_domain,
+            replace(input_domain, frequency=target_freq, step_count=step_count),
         )
 
     def _lower_align_frequency(self, expr: OperatorExpr) -> str:
@@ -534,7 +514,7 @@ class Compiler:
         if len(inputs) != 1:
             raise CompileError("align_frequency requires one data expression")
         input_id, input_term = input_ids[0], inputs[0]
-        if input_term.layout.scalar:
+        if input_term.domain is None:
             raise DomainError("Cannot align a scalar frequency")
         params = dict(params)
         if "target_freq" not in params:
@@ -547,17 +527,14 @@ class Compiler:
         method = str(params.pop("method"))
         if params:
             raise CompileError(f"Unknown align_frequency parameters: {sorted(params)}")
-        input_domain = self._business_domain(input_id)
-        if input_domain is None:
-            raise DomainError("align_frequency requires one unambiguous Source domain")
-        source_freq = input_domain.frequency
+        source_freq = input_term.domain.frequency
         if method != "ffill":
             raise CompileError("align_frequency first version only supports 'ffill'")
         if not is_intraday_freq(source_freq) or not is_intraday_freq(target_freq):
             raise DomainError(
                 "align_frequency only supports coarse intraday to fine intraday"
             )
-        if input_term.layout.step_count != len(get_freq_step_values(source_freq)):
+        if input_term.domain.step_count != len(get_freq_step_values(source_freq)):
             raise DomainError(
                 "align_frequency requires the complete standard source step axis"
             )
@@ -567,15 +544,14 @@ class Compiler:
         except ValueError as exc:
             raise DomainError(str(exc)) from exc
         output_domain = replace(
-            input_domain,
+            input_term.domain,
             frequency=target_freq,
             step_count=len(step_index),
         )
-        return self._explicit_operator(
+        return self._domain_operator(
             spec.name,
             input_id,
             {"step_index": tuple(step_index.tolist())},
-            ArrayLayout(False, input_term.layout.asset_count, len(step_index)),
             output_domain,
         )
 
@@ -586,13 +562,7 @@ class Compiler:
             raise CompileError("asset selection requires one data expression")
         input_id = self._lower(expr.args[0])
         input_term = self._terms[input_id]
-        input_domain = self._business_domain(input_id)
-        if (
-            input_term.layout.scalar
-            or input_domain is None
-            or input_domain.codes is None
-            or input_term.layout.asset_count != len(input_domain.codes)
-        ):
+        if input_term.domain is None or input_term.domain.codes is None:
             raise DomainError("asset selection requires a named asset axis")
         params = dict(expr.params)
         code = params.pop("code")
@@ -601,179 +571,104 @@ class Compiler:
             raise CompileError(f"Unknown asset selection parameters: {sorted(params)}")
         if (
             expected_asset_type is not None
-            and input_domain.asset_type != expected_asset_type
+            and input_term.domain.asset_type != expected_asset_type
         ):
             raise DomainError(
                 f"Selection requires asset type {expected_asset_type!r}, got "
-                f"{input_domain.asset_type!r}"
+                f"{input_term.domain.asset_type!r}"
             )
         # 编译期将稳定代码解析为位置，运行期仅执行数组切片。
         try:
-            position = input_domain.codes.index(code)
+            position = input_term.domain.codes.index(code)
         except ValueError as exc:
             raise DomainError(
                 f"Asset code {code!r} is not present on the input axis"
             ) from exc
-        output_domain = replace(input_domain, codes=(code,))
-        return self._explicit_operator(
+        output_domain = replace(input_term.domain, codes=(code,))
+        return self._domain_operator(
             "select_by_pos",
             input_id,
             {"pos": position, "axis": 1, "keepdims": True},
-            replace(input_term.layout, asset_count=1),
             output_domain,
         )
 
-    def _lower_lookup_by_col(self, expr: OperatorExpr) -> str:
-        """把显式资产映射降低为由 mapping 的 N 决定的布局。"""
-
-        spec = self.operators[expr.name]
-        input_exprs, input_names, params = _canonical_call(expr, spec)
-        input_ids = tuple(self._lower(arg) for arg in input_exprs)
-        inputs = tuple(self._terms[term_id] for term_id in input_ids)
-        _validate_operator(spec, inputs, input_names, params)
-        if len(inputs) != 2 or any(term.layout.scalar for term in inputs):
-            raise DomainError("lookup_by_col requires two tensor inputs")
-        source, mapping = inputs
-        if mapping.layout.step_count != 1:
-            raise DomainError("lookup_by_col mapping must have one step")
-        step_count = numpy_layout(
-            (
-                source.layout,
-                replace(mapping.layout, asset_count=source.layout.asset_count),
-            ),
-            {},
-        ).step_count
-        layout = ArrayLayout(False, mapping.layout.asset_count, step_count)
-        source_domain = self._business_domain(input_ids[0])
-        mapping_domain = self._business_domain(input_ids[1])
-        output_domain = None
-        if source_domain is not None and mapping_domain is not None:
-            output_domain = replace(
-                mapping_domain,
-                frequency=source_domain.frequency,
-                step_count=step_count,
-            )
-        return self._explicit_operator(
-            spec.name,
-            input_ids,
-            params,
-            layout,
-            output_domain,
-            input_names=input_names,
-            value_kind=_output_kind(spec, inputs),
-            lookback=max(term.lookback for term in inputs),
-        )
-
-    def _validate_output_layout(
-        self, formula_id: str, layout: ArrayLayout
+    def _validate_output_domain(
+        self, formula_id: str, domain: TermDomain | None
     ) -> None:
-        """只校验输出能否按物理 N/S 广播到目标布局。"""
-
-        if layout.scalar:
+        """校验输出坐标，仅放行已确认的 singleton 广播。"""
+        # 标量与跨日历输出无法参与目标数组计算。
+        if domain is None:
             raise DomainError(f"Formula {formula_id!r} output cannot be scalar")
-        target = self._target_layout
-        if layout.asset_count not in {1, target.asset_count}:
+        target = self._target_domain
+        if domain.calendar != target.calendar:
             raise DomainError(
-                f"Formula {formula_id!r} output asset count {layout.asset_count} "
-                f"cannot broadcast to target asset count {target.asset_count}"
+                f"Formula {formula_id!r} output calendar does not match target"
             )
-        if layout.step_count not in {1, target.step_count}:
+        # 单资产轴可广播；多资产轴则必须与目标轴完全同一。
+        if domain.asset_count != 1 and (
+            domain.asset_type,
+            domain.codes,
+            domain.axis_fingerprint,
+        ) != (
+            target.asset_type,
+            target.codes,
+            target.axis_fingerprint,
+        ):
             raise DomainError(
-                f"Formula {formula_id!r} output step count {layout.step_count} "
+                f"Formula {formula_id!r} output asset axis does not match target"
+            )
+        # 同频率直接兼容，日频单 step 允许广播到分钟 step 轴。
+        frequency_compatible = domain.frequency == target.frequency or (
+            domain.frequency == "1d"
+            and domain.step_count == 1
+            and is_intraday_freq(target.frequency)
+        )
+        if not frequency_compatible:
+            raise DomainError(
+                f"Formula {formula_id!r} output frequency {domain.frequency!r} "
+                f"does not match target {target.frequency!r}; align it explicitly"
+            )
+        if domain.step_count not in {1, target.step_count}:
+            raise DomainError(
+                f"Formula {formula_id!r} output step count {domain.step_count} "
                 f"cannot broadcast to target step count {target.step_count}"
             )
 
-    def _explicit_operator(
+    def _domain_operator(
         self,
         name: str,
-        input_id: str | tuple[str, ...],
+        input_id: str,
         params: Mapping[str, Any],
-        layout: ArrayLayout,
-        source_domain: SourceDomain | None,
-        *,
-        input_names: tuple[str | None, ...] | None = None,
-        value_kind: ValueKind | None = None,
-        lookback: int | None = None,
+        domain: TermDomain,
     ) -> str:
-        """创建需要 Source 元数据的显式 lowering OperatorTerm。"""
-
-        input_ids = (input_id,) if isinstance(input_id, str) else input_id
-        input_terms = tuple(self._terms[item] for item in input_ids)
+        """创建或复用一个具有显式输出领域的内部运算符 Term。"""
+        # 参数先规范化，确保同语义内部转换能够命中公共子表达式。
+        input_term = self._terms[input_id]
         normalized = {
             key: _normalize_value(value) for key, value in sorted(params.items())
         }
         semantic = stable_hash(
-            "explicit_operator",
+            "domain_operator",
             name,
-            input_ids,
+            input_id,
             normalized,
-            (value_kind or input_terms[0].value_kind).value,
-            layout,
+            input_term.value_kind.value,
+            domain,
         )
-        term_id = self._intern(
+        return self._intern(
             semantic,
             lambda term_id: OperatorTerm(
                 term_id,
-                value_kind or input_terms[0].value_kind,
-                layout,
-                input_terms[0].lookback if lookback is None else lookback,
+                input_term.value_kind,
+                domain,
+                input_term.lookback,
                 semantic,
                 name,
-                input_ids,
-                input_names or (None,) * len(input_ids),
+                (input_id,),
+                (None,),
                 MappingProxyType(normalized),
             ),
         )
-        if source_domain is not None:
-            self._special_domains[term_id] = source_domain
-        return term_id
-
-    def _business_domain(self, term_id: str) -> SourceDomain | None:
-        """依赖溯源得到显式 lowering 所需的唯一 Source 业务域。"""
-
-        if term_id in self._special_domains:
-            return self._special_domains[term_id]
-        term = self._terms[term_id]
-        if isinstance(term, SourceTerm):
-            return term.source_domain
-        if not isinstance(term, OperatorTerm):
-            return None
-        domains = {
-            domain
-            for dependency in term.input_term_ids
-            if (domain := self._business_domain(dependency)) is not None
-        }
-        return next(iter(domains)) if len(domains) == 1 else None
-
-    def _layout_error(
-        self,
-        error: DomainError,
-        input_ids: tuple[str, ...],
-        inputs: tuple[Term, ...],
-    ) -> DomainError:
-        """在 N 不可广播时按需附加无歧义的 Source 资产类型诊断。"""
-
-        if not str(error).startswith("Incompatible asset dimensions"):
-            return error
-        candidates = [
-            (self._business_domain(term_id), term.layout.asset_count)
-            for term_id, term in zip(input_ids, inputs, strict=True)
-            if not term.layout.scalar and term.layout.asset_count != 1
-        ]
-        if len(candidates) >= 2 and all(domain is not None for domain, _ in candidates):
-            left, right = next(
-                (left, right)
-                for index, left in enumerate(candidates)
-                for right in candidates[index + 1 :]
-                if left[1] != right[1]
-            )
-            assert left[0] is not None and right[0] is not None
-            return DomainError(
-                f"Asset dimension mismatch: {left[0].asset_type}(N={left[1]}) "
-                f"cannot broadcast with {right[0].asset_type}(N={right[1]}); "
-                "use an explicit mapping, selection, or reduction operator"
-            )
-        return error
 
     def _intern(self, semantic: str, factory: Any) -> str:
         """按语义键复用 Term 或创建新的稳定 Term 标识。"""
@@ -825,6 +720,18 @@ def _source_identity(ref: SourceRefExpr) -> tuple[Any, ...]:
     """返回数据源引用参与逻辑计划身份的规范结构。"""
     return ref.logical_key, tuple(
         (key, _normalize_value(value)) for key, value in ref.semantic_params
+    )
+
+
+def _term_domain(domain: ResolvedOutputDomain) -> TermDomain:
+    """把已解析输出域转换为 Term 使用的不可变领域描述。"""
+    return TermDomain(
+        domain.asset_type,
+        tuple(domain.codes.tolist()),
+        domain.frequency,
+        len(domain.steps),
+        domain.calendar,
+        domain.axis_fingerprint,
     )
 
 

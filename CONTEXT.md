@@ -64,9 +64,9 @@ _避免使用_：不涉及成员语义时称为 Universe、资产列表
 计算任务请求返回的精确日期、目标资产、频率和 step 坐标。
 _避免使用_：读取范围、source 空间
 
-**Array Layout（数组布局）**:
-普通算子运行值的 `T × N × S` 结构，只描述维度大小和广播能力，不承诺资产、频率、step 或日历身份。
-_避免使用_：Term Domain、坐标空间
+**Term Domain**:
+逻辑计算图中一个值的资产、频率、step 和日历身份。
+_避免使用_：数组 shape、Output Domain
 
 **Read Domain（读取域）**:
 一个物理分区实际读取的日期和坐标范围，包含 lookback 所需历史。
@@ -82,12 +82,8 @@ _避免使用_：Offset、预热期
 任务计算图中的规范化可执行节点，只可能是 LiteralTerm、SourceTerm 或 OperatorTerm。
 _避免使用_：AST 节点、Feature
 
-**Normalized Source Array（规范数据源数组）**:
-按 SourceBinding 的 ReadDomain 排列、并在唯一 Load 规范化边界通过 dtype、shape、缺失值和 ValueKind 校验的 `T × N × S` 数组。
-_避免使用_：原始读取结果、FeatureArray
-
 **Logical Plan（逻辑计划）**:
-包含 Term 依赖、ArrayLayout、值契约和 lookback 的多输出逻辑图。
+包含 Term 依赖、Domain、值契约和 lookback 的多输出逻辑图。
 _避免使用_：执行调度、Physical Plan
 
 **Physical Plan（物理计划）**:

@@ -1,10 +1,5 @@
 # 取数对象与 DAG 编译链路
 
-> 本文记录当前实现。当前代码中的 `TermDomain` 和 `domain_rule` 将按
-> [`ADR-0001`](adr/0001-use-positional-array-layout-for-operators.md) 迁移为只描述
-> NumPy 维度结构的 `ArrayLayout`；Source 的业务坐标只在 describe/bind/load
-> 边界保留。
-
 本文说明新 batch pipeline 从“定义公共输入和公式”到“生成共享 LogicalPlan DAG”之间，所有取数相关对象、方法和元数据如何流转，以及这套分层背后的设计思路。
 
 本文以当前代码为准，只讨论：

@@ -1,8 +1,7 @@
 # 独立 DataProvider 设计
 
-- 状态：现有 Provider 已实现；Reader Strategy 与独立 LoadNormalizer 改造待实现
+- 状态：已实现；公司 HPC 分钟路径的性能基线待在对应环境记录
 - 范围：新 batch pipeline 的正式数据提供者，包含真正的批量 `load_many()`
-- 细化设计：[`Reader与Load规范化边界设计.md`](Reader与Load规范化边界设计.md)
 
 ## 1. 定位与分层
 
@@ -23,9 +22,8 @@ Formula AST -> Compiler -> LogicalPlan -> PhysicalPlanner
             -> Runtime -> DataProvider
 ```
 
-Provider 负责协调 Source Catalog、任务坐标快照、物理绑定、Reader、LoadNormalizer、
-任务级缓存和物理读取诊断。Reader 只执行物理 I/O，LoadNormalizer 独立负责把原始
-记录转换为权威 Runtime 数组。Provider 不解析公式，不执行因子
+Provider 负责 Source Catalog、任务坐标快照、物理绑定、数据集级批量读取、
+运行时数据规范化、任务级缓存和物理读取诊断。它不解析公式，不执行因子
 operator，不做频率聚合、资产投影、日期分区或结果存储。
 
 物理表、字段、路径和加载组只存在于 `bind_many()` 之后，不进入
@@ -96,10 +94,10 @@ Catalog 构建规则。每个任务启动时重新扫描配置的数据集字段
 只存在于任务内存中的 Catalog；暂不持久化解析结果，但记录其
 fingerprint 用于诊断和复现。
 
-配置保存物理位置、`reader` 策略和单数据集差异：Source 表和路径、资产轴使用的行情表
-和日期列，以及 `source_tables[].exclude_fields` 这类单表例外。稳定字段的 `ValueKind`
-和通用排除规则位于 [`data_provider/catalog.py`](../src/factor_engine/data_provider/catalog.py)，
-Reader 注册与少数具名派生查询位于 [`data_provider/datasets.py`](../src/factor_engine/data_provider/datasets.py)，
+配置只保存物理位置和单数据集差异：Source 表和路径、资产轴使用的行情表和日期列，
+以及 `source_tables[].exclude_fields` 这类单表例外。稳定字段的 `ValueKind` 和通用排除
+规则位于 [`data_provider/catalog.py`](../src/factor_engine/data_provider/catalog.py)，
+特殊 Source SQL 约定位于 [`data_provider/datasets.py`](../src/factor_engine/data_provider/datasets.py)，
 共用 SQL/DuckDB 能力位于
 [`data_provider/backend.py`](../src/factor_engine/data_provider/backend.py)，不把每个固定列
 重复展开成配置协议。`SmartQuantDataProvider` 只协调任务状态和五个 Provider 方法。
@@ -108,7 +106,7 @@ Reader 注册与少数具名派生查询位于 [`data_provider/datasets.py`](../
 和薄 `smartquant.py`。旧 `legacy/data/router.py`、`legacy/data/smartquant.py` 与 FeatureArray
 只属于 legacy 研究层，不进入正式 Provider 依赖链。
 
-Catalog 对每个 Dataset 和逻辑 Source 至少描述：
+Catalog 对每个逻辑 Source 至少描述：
 
 ```text
 logical key
@@ -155,7 +153,7 @@ Provider 不执行分钟频率 resample。已保存因子继续通过组合 Prov
 不代表 Catalog 无效；单元测试使用临时 parquet，真实路径和性能集成测试在 HPC
 环境执行。
 
-## 6. Reader Strategy 与真正的批量读取
+## 6. 真正的批量读取
 
 相同物理数据集、相同 ReadDomain 和兼容查询语义的字段组成一个 LoadGroup：
 
@@ -166,16 +164,9 @@ Provider 不执行分钟频率 resample。已保存因子继续通过组合 Prov
 - 无法批量读取的 Source 允许显式 fallback，并记录原因；
 - 组内任一必要字段失败时，整个 LoadGroup 和任务立即失败。
 
-Reader 按物理布局而不是业务 frequency 分类。首版通用策略为 `sql_panel`、
-`parquet_bars`、`ranked_sql_panel`、`sparse_sql_panel` 和 `static_relation`；
-AdjustFactor、Untradable 使用各自具名 Reader，不提供万能 `custom` 分派。现有具体
-source 名称不再直接作为通用 loader 分派键；详细映射和配置边界见
-[`Reader与Load规范化边界设计.md`](Reader与Load规范化边界设计.md)。
-
 ## 7. 数据规范化
 
-Reader 返回 RawBatch；独立 LoadNormalizer 将其转换为 NormalizedSourceBatch。
-`load_many()` 对外返回的每个数组必须精确满足：
+`load_many()` 返回的每个数组必须精确满足：
 
 ```text
 dtype   = float64
@@ -183,12 +174,9 @@ shape   = T x N x S
 missing = NaN
 ```
 
-LoadNormalizer 是唯一负责按 binding 对齐日期、资产代码顺序和原生 step，规范化数据库
-NULL、sentinel、bool、code 和数值字段，并校验 MASK/CODE 协议、重复坐标、未知坐标、
-错误 dtype、shape 和不完整 LoadGroup 的组件。Reader 和 Runtime 不重复这些转换与扫描。
-
-ValueKind 只定义有限值的逻辑集合；Infinity 策略属于统一 Runtime 值协议。LoadNormalizer
-先把正负 Infinity 转为 NaN，再执行 MASK/CODE 校验。
+Provider 负责按 binding 对齐日期、资产代码顺序和原生 step，规范化数据库 NULL、
+sentinel、bool、code 和数值字段，并校验 MASK/CODE 协议、重复坐标、未知坐标、
+错误 dtype、shape 和不完整 LoadGroup。
 
 查询成功但某资产某日没有观测属于正常 Missing，填充 NaN；文件、字段或查询失败，
 无法解释的重复坐标以及 Provider 契约错误均中止任务。

@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field as dataclass_field
-from types import MappingProxyType
 from typing import Any, Mapping, Protocol, Sequence
 
 import numpy as np
 
-from .domain import ArrayLayout, ValueKind, parse_feature_key
+from .domain import ValueKind, parse_feature_key
 from .formula import FormulaBatch, SourceRefExpr
 
 
@@ -73,8 +72,8 @@ class ResolvedOutputDomain:
 
 
 @dataclass(frozen=True)
-class SourceDomain:
-    """Source 边界使用的资产、频率、step 与日历身份。"""
+class TermDomain:
+    """逻辑计算图中一个值的资产、频率、step 与日历身份。"""
 
     asset_type: str
     codes: tuple[Any, ...] | None
@@ -85,7 +84,7 @@ class SourceDomain:
 
     @property
     def asset_count(self) -> int:
-        """返回 Source 物理资产轴长度。"""
+        """返回物理资产轴长度，其中匿名归约结果固定为 singleton。"""
         return 1 if self.codes is None else len(self.codes)
 
 
@@ -112,18 +111,6 @@ class InputSpec:
 
 
 @dataclass(frozen=True)
-class DatasetSpec:
-    """描述一个可由具名 Reader 读取的物理数据集及其最小物理参数。"""
-
-    dataset_id: str
-    reader: str
-    asset: str
-    frequency: str
-    params: Mapping[str, Any] = dataclass_field(default_factory=dict)
-    query_builder: str | None = None
-
-
-@dataclass(frozen=True)
 class SourceSpec:
     """分区绑定后产生的中性物理数据源描述。"""
 
@@ -134,11 +121,6 @@ class SourceSpec:
     table: str | None = None
     field: str | None = None
     params: Mapping[str, Any] = dataclass_field(default_factory=dict)
-    # dataset_id 是 SmartQuant Reader 路由的权威引用；source/table 暂留作兼容字段。
-    dataset_id: str | None = None
-    constant: Any | None = None
-    default: Any = np.nan
-    projection: str | None = None
 
     @property
     def key(self) -> str:
@@ -179,10 +161,6 @@ class SourceSpec:
             "table": self.table,
             "field": self.field,
             "params": dict(self.params),
-            "dataset_id": self.dataset_id,
-            "constant": self.constant,
-            "default": self.default,
-            "projection": self.projection,
         }
 
 
@@ -195,52 +173,6 @@ class SourceBinding:
     read_domain: ReadDomain
     load_group_key: str
     value_kind: ValueKind = ValueKind.NUMERIC
-
-
-@dataclass(frozen=True)
-class ReaderRequest:
-    """一个 Reader 执行单个 LoadGroup 所需的物理规格、读取域和任务依赖。"""
-
-    dataset: DatasetSpec
-    bindings: tuple[SourceBinding, ...]
-    read_domain: ReadDomain
-    context: Mapping[str, Any]
-
-
-@dataclass(frozen=True)
-class RawBatch:
-    """Reader 返回的未规范化一维坐标列和值列，不承诺最终 dtype 或 shape。"""
-
-    coordinate_mode: str
-    coordinates: Mapping[str, Any]
-    values: Mapping[str, Any]
-
-
-@dataclass(frozen=True)
-class NormalizedSourceBatch(Mapping[str, np.ndarray]):
-    """Source Load 边界交付给 Runtime 的只读规范数组集合。"""
-
-    arrays: Mapping[str, np.ndarray]
-
-    def __post_init__(self) -> None:
-        """复制并冻结 term_id 映射，防止交付后增删 Source 数组。"""
-
-        object.__setattr__(self, "arrays", MappingProxyType(dict(self.arrays)))
-
-    def __getitem__(self, key: str) -> np.ndarray:
-        """按 term_id 返回对应的只读规范数组。"""
-
-        return self.arrays[key]
-
-    def __iter__(self):
-        """按底层映射顺序遍历 term_id。"""
-
-        return iter(self.arrays)
-
-    def __len__(self) -> int:
-        """返回规范批次包含的 Source 数组数量。"""
-
-        return len(self.arrays)
 
 
 class DataProvider(Protocol):
@@ -271,7 +203,7 @@ class DataProvider(Protocol):
         """把数据源 Term 批量绑定为当前分区的物理读取描述。"""
         ...
 
-    def load_many(self, bindings: Sequence[SourceBinding]) -> NormalizedSourceBatch:
+    def load_many(self, bindings: Sequence[SourceBinding]) -> Mapping[str, np.ndarray]:
         """按物理绑定批量加载以 Term 标识索引的数组。"""
         ...
 
@@ -282,7 +214,7 @@ class Term:
 
     term_id: str
     value_kind: ValueKind
-    layout: ArrayLayout
+    domain: TermDomain | None
     lookback: int
     semantic_key: str
 
@@ -300,7 +232,6 @@ class SourceTerm(Term):
 
     source_ref: SourceRefExpr
     input_spec: InputSpec
-    source_domain: SourceDomain
 
 
 @dataclass(frozen=True)
