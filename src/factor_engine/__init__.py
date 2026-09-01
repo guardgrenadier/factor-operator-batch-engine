@@ -31,6 +31,7 @@ from .formula import (
     source,
 )
 from .model import (
+    ArrayLayout,
     CompiledJob,
     CompileError,
     ComputeRequest,
@@ -57,6 +58,7 @@ from .providers import MemoryDataProvider
 from .repository import RepositoryDataProvider, TemporaryFactorRepository
 
 __all__ = [
+    "ArrayLayout",
     "BatchFactorEngine",
     "BatchResult",
     "Binding",

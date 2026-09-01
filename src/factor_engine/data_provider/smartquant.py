@@ -28,7 +28,7 @@ from .backend import (
     sql_table,
 )
 from .catalog import Catalog
-from .datasets import load_group
+from .readers import load_group
 
 
 class SmartQuantDataProvider:
@@ -173,13 +173,15 @@ class SmartQuantDataProvider:
                 tuple(get_step_values(term.domain.frequency, term.domain.step_count)),
                 read_domain.output_slice,
             )
-            # 计算加载组键：忽略字段级参数，使同一物理数据集可合并读取。
+            # 加载组兼容键：数据集、Reader、Query Builder 与影响物理行集合或
+            # 坐标解码的共享参数；字段级参数（字段、常量、默认值、投影）不拆组。
             compatibility = dict(source_spec.params)
-            compatibility.pop("column_name", None)
-            compatibility.pop("kind", None)
+            for field_level in _FIELD_LEVEL_PARAMS:
+                compatibility.pop(field_level, None)
             group = stable_hash(
                 "load_group",
-                source_spec.source,
+                source_spec.reader,
+                source_spec.query_builder,
                 source_spec.table,
                 compatibility,
                 source_domain.dates,
@@ -238,3 +240,8 @@ class SmartQuantDataProvider:
             "mode", "batch" if len(payload.get("fields", ())) > 1 else "single"
         )
         self.diagnostics.append(payload)
+
+
+_FIELD_LEVEL_PARAMS = frozenset(
+    {"column_name", "kind", "projection", "constant", "default", "field"}
+)

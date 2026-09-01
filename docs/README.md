@@ -1,6 +1,7 @@
 # 文档目录
 
 - 正式设计：根目录 [`FACTOR_ENGINE_DESIGN.md`](../FACTOR_ENGINE_DESIGN.md)
+- 数组布局与数据加载边界（Reader/Query Builder/LoadNormalizer 权威设计）：[`数组布局与数据加载边界设计.md`](数组布局与数据加载边界设计.md)（[ADR-0001](adr/0001-use-positional-array-layout-for-operators.md)）
 - 领域术语：根目录 [`CONTEXT.md`](../CONTEXT.md)
 - 当前调用链：[`调用链_最新.md`](调用链_最新.md)
 - 调用链设计解读（走读式，含例子）：[`调用链设计解读_walkthrough.md`](调用链设计解读_walkthrough.md)

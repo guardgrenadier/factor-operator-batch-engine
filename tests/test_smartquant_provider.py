@@ -17,17 +17,13 @@ from factor_engine import (
     ExecutionOptions,
     FormulaBatch,
     OperatorTerm,
-    ReadDomain,
     SmartQuantDataProvider,
-    SourceBinding,
     SourceRefExpr,
-    SourceSpec,
     SourceTerm,
     ValueKind,
 )
+from factor_engine.data_provider.backend import DuckDBBackend
 from factor_engine.domain import get_freq_step_count, get_freq_step_values
-from factor_engine.data_provider.backend import DuckDBBackend, sql_literal_list
-from factor_engine.data_provider.normalize import scatter_positions, scatter_rows
 
 
 AXIS_SOURCE = {
@@ -35,6 +31,8 @@ AXIS_SOURCE = {
     "freq": "1d",
     "source": "ReturnDaily",
     "table": "SmartQuant.ReturnDaily",
+    "reader": "sql_reader",
+    "query_builder": "panel_fields",
     "asset_axis": True,
     "date_col": "DataDate",
     "trading_flag_col": "IfTradingDay",
@@ -194,6 +192,7 @@ def _minute_source(template: str, fields: list[str]) -> dict[str, object]:
         "freq": "1min",
         "source": "MinuteParquet",
         "table": template,
+        "reader": "parquet_bars",
         "path_template": template,
         "date_col": "trading_day",
         "date_col_type": "date",
@@ -207,39 +206,31 @@ def _minute_source(template: str, fields: list[str]) -> dict[str, object]:
 
 
 def _legacy_minute_arrays(
-    paths, code_map: pd.DataFrame, bindings: tuple[SourceBinding, ...]
+    paths, code_map: pd.DataFrame, dates, codes, steps
 ) -> dict[str, np.ndarray]:
-    """用旧版逐行散点方式为分钟数据源基准值数组。"""
-    domain = bindings[0].read_domain
-    legacy_map = code_map.copy()
-    legacy_map["date_key"] = legacy_map["DataDate"]
-    legacy_map["date_idx"] = legacy_map["date_key"].map(
-        {date: idx for idx, date in enumerate(domain.dates)}
-    )
-    legacy_map["asset_idx"] = legacy_map["InnerCode"].map(
-        {code: idx for idx, code in enumerate(domain.codes)}
-    )
-    step_axis = pd.DataFrame(
-        {"start_time": domain.steps, "step_idx": range(len(domain.steps))}
-    )
-    aliases = {
-        binding.term_id: f"value_{position}"
-        for position, binding in enumerate(bindings)
+    """用逐行字典散点方式为分钟数据源构造基准值数组。"""
+    shape = (len(dates), len(codes), len(steps))
+    result = {
+        name: np.full(shape, np.nan, dtype=np.float64) for name in ("close", "volume")
     }
-    select = ", ".join(
-        f'p."{binding.source_spec.field}" AS "{aliases[binding.term_id]}"'
-        for binding in bindings
-    )
-    rows = DuckDBBackend().query(
-        "SELECT m.date_idx, m.asset_idx, s.step_idx, "
-        + select
-        + f" FROM read_parquet({sql_literal_list([path.as_posix() for path in paths])}) p "
-        "INNER JOIN code_map m ON strftime(p.trading_day, '%Y%m%d') = m.date_key "
-        "AND CAST(p.security_code AS VARCHAR) = CAST(m.SecuCode AS VARCHAR) "
-        "INNER JOIN step_axis s ON p.start_time = s.start_time",
-        tables={"code_map": legacy_map, "step_axis": step_axis},
-    )
-    return scatter_positions(bindings, rows, aliases)
+    step_pos = {step: pos for pos, step in enumerate(steps)}
+    code_pos = {code: pos for pos, code in enumerate(codes)}
+    mapping = {
+        date: dict(zip(group["SecuCode"], group["InnerCode"], strict=True))
+        for date, group in code_map.groupby("DataDate")
+    }
+    for date_idx, (date, path) in enumerate(zip(dates, paths, strict=True)):
+        frame = pd.read_parquet(path)
+        for row in frame.itertuples(index=False):
+            inner = mapping[date].get(str(row.security_code))
+            if inner not in code_pos or row.start_time not in step_pos:
+                continue
+            for name in result:
+                value = float(getattr(row, name))
+                result[name][date_idx, code_pos[inner], step_pos[row.start_time]] = (
+                    value if np.isfinite(value) else np.nan
+                )
+    return result
 
 
 def _projection_provider() -> SmartQuantDataProvider:
@@ -247,7 +238,7 @@ def _projection_provider() -> SmartQuantDataProvider:
     return SmartQuantDataProvider(
         backend=_ProjectionReader(),
         source_config={
-            "schema_version": 2,
+            "schema_version": 3,
             "source_tables": [
                 {
                     **AXIS_SOURCE,
@@ -264,6 +255,8 @@ def _projection_provider() -> SmartQuantDataProvider:
                     "freq": "1d",
                     "source": "CBReturnDaily",
                     "table": "SmartQuant.CBReturnDaily",
+                    "reader": "sql_reader",
+                    "query_builder": "panel_fields",
                     "asset_axis": True,
                     "date_col": "DataDate",
                     "trading_flag_col": "IfTradingDay",
@@ -276,9 +269,10 @@ def _projection_provider() -> SmartQuantDataProvider:
                     "freq": "1d",
                     "source": "CBStockMap",
                     "table": "JYDB.Bond_ConBDBasicInfo",
+                    "reader": "cb_stock_map",
                     "field": "StockInnerCode",
                     "value_kind": "code",
-                    "params": {"kind": "col"},
+                    "params": {"projection": "axis_position"},
                 }
             },
         },
@@ -291,7 +285,7 @@ def test_task_domain_lookback_and_daily_fields_use_one_sql() -> None:
     provider = SmartQuantDataProvider(
         backend=reader,
         source_config={
-            "schema_version": 2,
+            "schema_version": 3,
             "source_tables": [
                 {
                     **AXIS_SOURCE,
@@ -343,7 +337,7 @@ def test_explicit_axis_is_validated_and_keeps_caller_order() -> None:
     provider = SmartQuantDataProvider(
         backend=reader,
         source_config={
-            "schema_version": 2,
+            "schema_version": 3,
             "source_tables": [AXIS_SOURCE],
             "sources": {},
         },
@@ -360,7 +354,7 @@ def test_wide_and_asset_axis_support_custom_code_col() -> None:
     provider = SmartQuantDataProvider(
         backend=reader,
         source_config={
-            "schema_version": 2,
+            "schema_version": 3,
             "source_tables": [
                 {
                     **AXIS_SOURCE,
@@ -460,7 +454,10 @@ def test_minute_fields_share_one_parquet_scan(tmp_path, monkeypatch) -> None:
     def reject_dataset_copy(frame, *args, **kwargs):
         """断言查询数据集内部 DataFrame 不被额外复制。"""
         caller = sys._getframe(1).f_globals.get("__name__")
-        if caller == "factor_engine.data_provider.datasets":
+        if caller in {
+            "factor_engine.data_provider.readers",
+            "factor_engine.data_provider.normalize",
+        }:
             raise AssertionError("private query DataFrame must not be copied")
         return original_copy(frame, *args, **kwargs)
 
@@ -472,7 +469,7 @@ def test_minute_fields_share_one_parquet_scan(tmp_path, monkeypatch) -> None:
         backend=reader,
         duckdb=duckdb,
         source_config={
-            "schema_version": 2,
+            "schema_version": 3,
             "source_tables": [
                 AXIS_SOURCE,
                 {
@@ -548,13 +545,15 @@ def test_cb_minute_keeps_date_dependent_code_map(tmp_path) -> None:
     provider = SmartQuantDataProvider(
         backend=reader,
         source_config={
-            "schema_version": 2,
+            "schema_version": 3,
             "source_tables": [
                 {
                     "asset": "cb",
                     "freq": "1d",
                     "source": "CBReturnDaily",
                     "table": "SmartQuant.CBReturnDaily",
+                    "reader": "sql_reader",
+                    "query_builder": "panel_fields",
                     "asset_axis": True,
                     "date_col": "DataDate",
                     "trading_flag_col": "IfTradingDay",
@@ -591,7 +590,7 @@ def test_cb_minute_keeps_date_dependent_code_map(tmp_path) -> None:
 
 
 def test_minute_streaming_matches_shape_dtype_values_and_alignment(tmp_path) -> None:
-    """验证分钟流式读取的形状、类型、数值与旧版逐行对齐一致。"""
+    """验证分钟流式读取的形状、类型、数值与逐行散点基线一致。"""
     # 构造编码映射与含缺失、无穷的乱序分钟原始行。
     code_map = pd.DataFrame(
         {
@@ -627,7 +626,7 @@ def test_minute_streaming_matches_shape_dtype_values_and_alignment(tmp_path) -> 
         backend=_MinuteReader(code_map),
         duckdb=DuckDBBackend(arrow_batch_rows=2),
         source_config={
-            "schema_version": 2,
+            "schema_version": 3,
             "source_tables": [
                 AXIS_SOURCE,
                 _minute_source(template, ["close", "volume"]),
@@ -655,27 +654,13 @@ def test_minute_streaming_matches_shape_dtype_values_and_alignment(tmp_path) -> 
 
     result = BatchFactorEngine(provider).compute(request)
 
-    # 用旧版读取域与数据源绑定重建逐行散点基线数组。
-    domain = ReadDomain(
-        ("20240102", "20240103"),
-        ("20240102", "20240103"),
-        (202, 101),
-        tuple(get_freq_step_values("1min")),
-        slice(0, 2),
-    )
-    bindings = tuple(
-        SourceBinding(
-            name,
-            SourceSpec("stk", "1min", name, field=name),
-            domain,
-            "minute",
-        )
-        for name in ("close", "volume")
-    )
+    # 用逐行散点基线重建基准值数组。
     legacy = _legacy_minute_arrays(
         [tmp_path / "20240102.parquet", tmp_path / "20240103.parquet"],
         code_map,
-        bindings,
+        ("20240102", "20240103"),
+        (202, 101),
+        tuple(get_freq_step_values("1min")),
     )
 
     assert result.arrays["close"].shape == (2, 2, 237)
@@ -737,7 +722,7 @@ def test_minute_streaming_rejects_duplicate_coordinates(
         backend=_MinuteReader(code_map),
         duckdb=DuckDBBackend(arrow_batch_rows=batch_rows),
         source_config={
-            "schema_version": 2,
+            "schema_version": 3,
             "source_tables": [
                 AXIS_SOURCE,
                 _minute_source(template, ["close"]),
@@ -767,53 +752,6 @@ def test_minute_streaming_rejects_duplicate_coordinates(
         BatchFactorEngine(provider).compute(request)
 
 
-def test_scatter_uses_existing_value_column_and_membership_constant() -> None:
-    """验证逐行散点复用已有 value 列并填充成员常量。"""
-    domain = ReadDomain(
-        ("20240102",),
-        ("20240102",),
-        (101, 202),
-        (0,),
-        slice(0, 1),
-    )
-    weight = SourceBinding(
-        "weight",
-        SourceSpec("stk", "1d", "weight", params={"kind": "index_weight"}),
-        domain,
-        "index",
-    )
-    member = SourceBinding(
-        "member",
-        SourceSpec(
-            "stk", "1d", "member", params={"kind": "index_membership"}
-        ),
-        domain,
-        "index",
-        ValueKind.MASK,
-    )
-    rows = pd.DataFrame(
-        {
-            "DataDate": ["20240102"],
-            "InnerCode": [101],
-            "value": [0.25],
-        }
-    )
-
-    result = scatter_rows(
-        (weight, member),
-        rows,
-        {"weight": "value"},
-        constants={"member": 1.0},
-        defaults={"member": 0.0},
-    )
-
-    np.testing.assert_allclose(
-        result["weight"][:, :, 0], [[0.25, np.nan]], equal_nan=True
-    )
-    np.testing.assert_array_equal(result["member"][:, :, 0], [[1.0, 0.0]])
-    assert rows.columns.tolist() == ["value"]
-
-
 def test_minute_group_fails_when_any_partition_file_is_missing(tmp_path) -> None:
     """验证任一分区文件缺失时加载组整体报错。"""
     pd.DataFrame(
@@ -828,22 +766,11 @@ def test_minute_group_fails_when_any_partition_file_is_missing(tmp_path) -> None
     provider = SmartQuantDataProvider(
         backend=_Reader(),
         source_config={
-            "schema_version": 2,
+            "schema_version": 3,
             "source_tables": [
                 AXIS_SOURCE,
                 {
-                    "asset": "stk",
-                    "freq": "1min",
-                    "source": "MinuteParquet",
-                    "table": template,
-                    "path_template": template,
-                    "date_col": "trading_day",
-                    "fields": [
-                        "trading_day",
-                        "security_code",
-                        "start_time",
-                        "close",
-                    ],
+                    **_minute_source(template, ["close"]),
                 },
             ],
             "sources": {},

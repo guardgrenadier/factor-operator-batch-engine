@@ -8,9 +8,7 @@ import pytest
 from factor_engine import (
     BatchFactorEngine,
     ComputeRequest,
-    DataProviderError,
     DomainSpec,
-    InputSpec,
     MemoryDataProvider,
 )
 from factor_engine.domain import ValueKind
@@ -237,28 +235,6 @@ def test_batch_runtime_preserves_comparison_missing_and_float64_mask_dtype() -> 
     )
 
 
-def test_batch_runtime_rejects_invalid_mask_source_values() -> None:
-    """验证运行时拒绝取值非法的掩码源数据。"""
-    provider = MemoryDataProvider(
-        dates=["20240102"],
-        asset_codes={"stk": [1, 2]},
-        data={"stk.1d.mask": np.array([[1.0, 2.0]])},
-        input_specs={
-            "stk.1d.mask": InputSpec("stk", "1d", 1, value_kind=ValueKind.MASK)
-        },
-    )
-    request = ComputeRequest(
-        DomainSpec("20240102", "20240102", {"stk": "all"}, "stk", "1d", 1),
-        FormulaBatch.from_text(
-            common_inputs="mask = source('stk.1d.mask')",
-            formulas={"invalid": "factor = mask"},
-        ),
-    )
-
-    with pytest.raises(DataProviderError, match="only 0.0, 1.0, or NaN"):
-        BatchFactorEngine(provider).compute(request)
-
-
 def test_batch_runtime_rejects_invalid_mask_operator_results() -> None:
     """验证运行时拒绝取值非法的掩码算子结果。"""
     provider = MemoryDataProvider(
@@ -283,53 +259,6 @@ def test_batch_runtime_rejects_invalid_mask_operator_results() -> None:
 
     with pytest.raises(RuntimeExecutionError, match="only 0.0, 1.0, or NaN"):
         BatchFactorEngine(provider, operators=operators).compute(request)
-
-
-def test_batch_runtime_normalizes_source_infinity_and_validates_code_values() -> None:
-    """验证运行时把源数据无穷大归一为缺失。"""
-    provider = MemoryDataProvider(
-        dates=["20240102"],
-        asset_codes={"stk": [1, 2, 3]},
-        data={"stk.1d.code": np.array([[1.0, np.inf, np.nan]])},
-        input_specs={
-            "stk.1d.code": InputSpec("stk", "1d", 1, value_kind=ValueKind.CODE)
-        },
-    )
-    request = ComputeRequest(
-        DomainSpec("20240102", "20240102", {"stk": "all"}, "stk", "1d", 1),
-        FormulaBatch.from_text(
-            common_inputs="code = source('stk.1d.code')",
-            formulas={"code": "factor = code"},
-        ),
-    )
-
-    result = BatchFactorEngine(provider).compute(request)
-
-    np.testing.assert_allclose(
-        result.arrays["code"][:, :, 0], [[1.0, np.nan, np.nan]], equal_nan=True
-    )
-
-
-def test_batch_runtime_rejects_non_integer_code_source_values() -> None:
-    """验证运行时拒绝非整数取值的编码类源数据。"""
-    provider = MemoryDataProvider(
-        dates=["20240102"],
-        asset_codes={"stk": [1]},
-        data={"stk.1d.code": np.array([[1.5]])},
-        input_specs={
-            "stk.1d.code": InputSpec("stk", "1d", 1, value_kind=ValueKind.CODE)
-        },
-    )
-    request = ComputeRequest(
-        DomainSpec("20240102", "20240102", {"stk": "all"}, "stk", "1d", 1),
-        FormulaBatch.from_text(
-            common_inputs="code = source('stk.1d.code')",
-            formulas={"invalid": "factor = code"},
-        ),
-    )
-
-    with pytest.raises(DataProviderError, match="contains non-integer values"):
-        BatchFactorEngine(provider).compute(request)
 
 
 def test_batch_runtime_rejects_non_integer_code_operator_results() -> None:

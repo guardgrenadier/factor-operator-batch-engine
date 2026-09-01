@@ -82,13 +82,14 @@ def test_daily_singleton_and_daily_multistep_use_numpy_broadcasting() -> None:
     )
 
 
-def test_daily_multistep_cannot_mix_directly_with_intraday_steps() -> None:
-    """验证日频多 step 不能直接与日内 step 运算。"""
-    values = np.ones((2, 3, 4), dtype=np.float64)
+def test_same_shape_different_frequencies_compute_positionally() -> None:
+    """验证 shape 相同但业务坐标不同的输入按位置计算（设计§3）。"""
+    fund = np.arange(24, dtype=np.float64).reshape(2, 3, 4)
+    price = np.ones((2, 3, 4), dtype=np.float64)
     provider = MemoryDataProvider(
         dates=DATES,
         asset_codes={"stk": STOCKS},
-        data={"stk.1d.fund": values, "stk.5min.price": values},
+        data={"stk.1d.fund": fund, "stk.5min.price": price},
         input_specs={
             "stk.1d.fund": InputSpec("stk", "1d", 4),
             "stk.5min.price": InputSpec("stk", "5min", 4),
@@ -104,22 +105,21 @@ def test_daily_multistep_cannot_mix_directly_with_intraday_steps() -> None:
         target_step_count=4,
     )
 
-    with pytest.raises(DomainError, match="incompatible frequencies"):
-        BatchFactorEngine(provider).compile(request)
+    result = BatchFactorEngine(provider).compute(request)
 
-    assert provider.load_calls == []
+    np.testing.assert_array_equal(result.arrays["alpha"], fund + price)
 
 
-def test_different_intraday_frequencies_require_explicit_alignment() -> None:
-    """验证不同日内频率间需要显式对齐才能运算。"""
+def test_incompatible_step_dimensions_fail_at_compile_time() -> None:
+    """验证 step 维不可广播时在编译期报普通 shape 错误。"""
     values = np.ones((2, 3, 4), dtype=np.float64)
     provider = MemoryDataProvider(
         dates=DATES,
         asset_codes={"stk": STOCKS},
-        data={"stk.5min.x": values, "stk.15min.y": values},
+        data={"stk.5min.x": values, "stk.15min.y": np.ones((2, 3, 3))},
         input_specs={
             "stk.5min.x": InputSpec("stk", "5min", 4),
-            "stk.15min.y": InputSpec("stk", "15min", 4),
+            "stk.15min.y": InputSpec("stk", "15min", 3),
         },
     )
     request = _request(
@@ -129,12 +129,14 @@ def test_different_intraday_frequencies_require_explicit_alignment() -> None:
         target_step_count=4,
     )
 
-    with pytest.raises(DomainError, match="incompatible frequencies"):
+    with pytest.raises(DomainError, match="Incompatible step dimensions"):
         BatchFactorEngine(provider).compile(request)
 
+    assert provider.load_calls == []
 
-def test_coarse_source_is_not_implicitly_aligned_to_fine_output() -> None:
-    """验证粗频源不会被隐式对齐到细频输出域。"""
+
+def test_coarse_source_cannot_broadcast_to_finer_step_output() -> None:
+    """验证粗频源的 step 维无法广播到更细的输出域时在编译期报错。"""
     values = np.ones((2, 3, 4), dtype=np.float64)
     provider = MemoryDataProvider(
         dates=DATES,
@@ -148,7 +150,7 @@ def test_coarse_source_is_not_implicitly_aligned_to_fine_output() -> None:
         target_step_count=8,
     )
 
-    with pytest.raises(DomainError, match="align it explicitly"):
+    with pytest.raises(DomainError, match="cannot broadcast to target"):
         BatchFactorEngine(provider).compile(request)
 
     assert provider.load_calls == []
@@ -236,7 +238,8 @@ def test_asset_selection_is_a_singleton_view_and_broadcasts_later() -> None:
         if isinstance(term, OperatorTerm) and term.operator_name == "select_by_pos"
     )
     assert selected_term.domain is not None
-    assert selected_term.domain.codes == (22,)
+    assert selected_term.domain.asset_count == 1
+    assert selected_term.domain.asset_type is None
     selected = select_by_pos(values, 1, axis=1, keepdims=True)
     assert selected.shape == (2, 1, 2)
     assert np.shares_memory(values, selected)
@@ -270,8 +273,8 @@ def test_cross_section_reduce_stays_singleton_until_output_boundary() -> None:
         if isinstance(term, OperatorTerm) and term.operator_name == "cs_mean"
     )
     assert reduce_term.domain is not None
-    assert reduce_term.domain.codes is None
     assert reduce_term.domain.asset_count == 1
+    assert reduce_term.domain.asset_type is None
 
 
 def test_member_reduce_returns_anonymous_singleton() -> None:
@@ -310,7 +313,9 @@ def test_member_reduce_returns_anonymous_singleton() -> None:
         for term in result.plan.terms.values()
         if isinstance(term, OperatorTerm) and term.operator_name == "member_mean"
     )
-    assert term.domain is not None and term.domain.codes is None
+    assert term.domain is not None
+    assert term.domain.asset_count == 1
+    assert term.domain.asset_type is None
 
 
 def test_group_codes_can_vary_by_step_and_return_the_full_asset_axis() -> None:
@@ -342,3 +347,146 @@ def test_group_codes_can_vary_by_step_and_return_the_full_asset_axis() -> None:
         result.arrays["alpha"],
         np.array([[[2.0, 10.0], [2.0, 25.0], [10.0, 25.0]]]),
     )
+
+
+def test_asset_dimension_mismatch_reports_both_asset_types() -> None:
+    """验证跨资产误用的编译诊断包含两侧资产类型与显式转换建议（设计§3.1）。"""
+    provider = MemoryDataProvider(
+        dates=DATES,
+        asset_codes={"stk": STOCKS, "cb": [101, 102]},
+        data={
+            "stk.1d.x": np.ones((2, 3, 1)),
+            "cb.1d.y": np.ones((2, 2, 1)),
+        },
+    )
+    request = ComputeRequest(
+        DomainSpec(
+            DATES[0],
+            DATES[-1],
+            {"stk": "all", "cb": "all"},
+            "stk",
+            "1d",
+            1,
+        ),
+        FormulaBatch.from_text(
+            common_inputs="x = source('stk.1d.x')\ny = source('cb.1d.y')",
+            formulas={"alpha": "factor = x + y"},
+        ),
+    )
+
+    with pytest.raises(
+        DomainError,
+        match=(
+            r"Asset dimension mismatch: stk\(N=3\) cannot broadcast with "
+            r"cb\(N=2\); use an explicit mapping, selection, or reduction operator"
+        ),
+    ):
+        BatchFactorEngine(provider).compile(request)
+
+    assert provider.load_calls == []
+
+
+def test_same_asset_count_different_asset_types_compute_positionally() -> None:
+    """验证资产数相同但资产类型不同的输入按位置计算。"""
+    stock = np.arange(6, dtype=np.float64).reshape(2, 3, 1)[:, :2]
+    bond = np.ones((2, 2, 1), dtype=np.float64)
+    provider = MemoryDataProvider(
+        dates=DATES,
+        asset_codes={"stk": STOCKS, "cb": [101, 102]},
+        data={"stk.1d.x": stock, "cb.1d.y": bond},
+        input_specs={
+            "stk.1d.x": InputSpec("stk", "1d", 1),
+            "cb.1d.y": InputSpec("cb", "1d", 1),
+        },
+    )
+    request = ComputeRequest(
+        DomainSpec(
+            DATES[0],
+            DATES[-1],
+            {"stk": [11, 22], "cb": "all"},
+            "stk",
+            "1d",
+            1,
+        ),
+        FormulaBatch.from_text(
+            common_inputs="x = source('stk.1d.x')\ny = source('cb.1d.y')",
+            formulas={"alpha": "factor = x + y"},
+        ),
+    )
+
+    result = BatchFactorEngine(provider).compute(request)
+
+    np.testing.assert_array_equal(result.arrays["alpha"], stock + bond)
+
+
+def test_singleton_asset_broadcast_ignores_asset_type() -> None:
+    """验证任意一侧 N=1 时允许广播，即使资产类型不同。"""
+    provider = MemoryDataProvider(
+        dates=DATES,
+        asset_codes={"stk": STOCKS, "idx": [300]},
+        data={
+            "stk.1d.x": np.arange(6, dtype=np.float64).reshape(2, 3, 1),
+            "idx.1d.y": np.array([[2.0], [3.0]]),
+        },
+    )
+    request = ComputeRequest(
+        DomainSpec(
+            DATES[0],
+            DATES[-1],
+            {"stk": "all", "idx": "all"},
+            "stk",
+            "1d",
+            1,
+        ),
+        FormulaBatch.from_text(
+            common_inputs="x = source('stk.1d.x')\ny = source('idx.1d.y')",
+            formulas={"alpha": "factor = x + y"},
+        ),
+    )
+
+    result = BatchFactorEngine(provider).compute(request)
+
+    expected = np.arange(6, dtype=np.float64).reshape(2, 3, 1) + [[[2.0]], [[3.0]]]
+    np.testing.assert_array_equal(result.arrays["alpha"], expected)
+
+
+def test_ambiguous_asset_provenance_falls_back_to_plain_shape_error() -> None:
+    """验证复合表达式无法确定唯一资产来源时退回普通 shape 错误（设计§3.1）。"""
+    provider = MemoryDataProvider(
+        dates=DATES,
+        asset_codes={"stk": STOCKS, "cb": [101, 102, 103], "idx": [300, 500]},
+        data={
+            "stk.1d.x": np.ones((2, 3, 1)),
+            "cb.1d.y": np.ones((2, 3, 1)),
+            "idx.1d.z": np.ones((2, 2, 1)),
+        },
+        input_specs={
+            "stk.1d.x": InputSpec("stk", "1d", 1),
+            "cb.1d.y": InputSpec("cb", "1d", 1),
+            "idx.1d.z": InputSpec("idx", "1d", 1),
+        },
+    )
+    # x + y 的 N 相同但资产来源混合，hint 失效后再与 idx 运算只报 shape 错误。
+    request = ComputeRequest(
+        DomainSpec(
+            DATES[0],
+            DATES[-1],
+            {"stk": "all", "cb": "all", "idx": "all"},
+            "stk",
+            "1d",
+            1,
+        ),
+        FormulaBatch.from_text(
+            common_inputs=(
+                "x = source('stk.1d.x')\n"
+                "y = source('cb.1d.y')\n"
+                "z = source('idx.1d.z')"
+            ),
+            formulas={"alpha": "factor = x + y + z"},
+        ),
+    )
+
+    with pytest.raises(DomainError, match="Incompatible asset dimensions"):
+        BatchFactorEngine(provider).compile(request)
+
+    assert provider.load_calls == []

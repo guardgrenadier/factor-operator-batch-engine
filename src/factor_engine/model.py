@@ -73,7 +73,7 @@ class ResolvedOutputDomain:
 
 @dataclass(frozen=True)
 class TermDomain:
-    """逻辑计算图中一个值的资产、频率、step 与日历身份。"""
+    """数据源值的资产、频率、step 与日历身份，只由 SourceTerm 携带。"""
 
     asset_type: str
     codes: tuple[Any, ...] | None
@@ -86,6 +86,21 @@ class TermDomain:
     def asset_count(self) -> int:
         """返回物理资产轴长度，其中匿名归约结果固定为 singleton。"""
         return 1 if self.codes is None else len(self.codes)
+
+
+@dataclass(frozen=True)
+class ArrayLayout:
+    """普通算子值的物理数组布局：只有形状，不携带业务坐标身份。
+
+    asset_type 与 frequency 是无歧义时沿计算图传播的溯源提示，仅用于
+    shape 失败诊断与 resample/align_frequency/select 等专属 lowering，
+    普通算子永远不比较它们。
+    """
+
+    asset_count: int
+    step_count: int
+    asset_type: str | None = None
+    frequency: str | None = None
 
 
 @dataclass(frozen=True)
@@ -121,6 +136,8 @@ class SourceSpec:
     table: str | None = None
     field: str | None = None
     params: Mapping[str, Any] = dataclass_field(default_factory=dict)
+    reader: str | None = None
+    query_builder: str | None = None
 
     @property
     def key(self) -> str:
@@ -161,6 +178,8 @@ class SourceSpec:
             "table": self.table,
             "field": self.field,
             "params": dict(self.params),
+            "reader": self.reader,
+            "query_builder": self.query_builder,
         }
 
 
@@ -214,7 +233,7 @@ class Term:
 
     term_id: str
     value_kind: ValueKind
-    domain: TermDomain | None
+    domain: TermDomain | ArrayLayout | None
     lookback: int
     semantic_key: str
 
@@ -228,16 +247,18 @@ class LiteralTerm(Term):
 
 @dataclass(frozen=True)
 class SourceTerm(Term):
-    """数据源引用 Term，携带数据源引用与输入规格。"""
+    """数据源引用 Term，携带数据源引用、输入规格与完整业务坐标身份。"""
 
+    domain: TermDomain | None
     source_ref: SourceRefExpr
     input_spec: InputSpec
 
 
 @dataclass(frozen=True)
 class OperatorTerm(Term):
-    """算子 Term，携带输入 Term、具名输入与参数。"""
+    """算子 Term，只携带物理数组布局，不携带业务坐标身份。"""
 
+    domain: ArrayLayout | None
     operator_name: str
     input_term_ids: tuple[str, ...]
     input_names: tuple[str | None, ...]

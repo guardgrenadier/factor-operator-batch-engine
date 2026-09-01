@@ -1,11 +1,13 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "source_tables": [
     {
       "asset": "stk",
       "freq": "1d",
       "source": "ReturnDaily",
       "table": "SmartQuant.ReturnDaily",
+      "reader": "sql_reader",
+      "query_builder": "panel_fields",
       "asset_axis": true,
       "date_col": "DataDate",
       "trading_flag_col": "IfTradingDay"
@@ -15,6 +17,8 @@
       "freq": "1d",
       "source": "CBReturnDaily",
       "table": "SmartQuant.CBReturnDaily",
+      "reader": "sql_reader",
+      "query_builder": "panel_fields",
       "asset_axis": true,
       "date_col": "DataDate",
       "trading_flag_col": "IfTradingDay"
@@ -24,6 +28,8 @@
       "freq": "1d",
       "source": "IndexQuote",
       "table": "JYDB.QT_IndexQuote",
+      "reader": "sql_reader",
+      "query_builder": "panel_fields",
       "asset_axis": true,
       "date_col": "TradingDay"
     },
@@ -32,6 +38,7 @@
       "freq": "1min",
       "source": "MinuteParquet",
       "table": "/data/cephfs/minute/one_minute_stat/{date}.parquet",
+      "reader": "parquet_bars",
       "data_type": "one_minute_stat",
       "path_template": "/data/cephfs/minute/one_minute_stat/{date}.parquet",
       "sample_date": "2024-12-31",
@@ -43,6 +50,7 @@
       "freq": "1min",
       "source": "MinuteParquet",
       "table": "/data/cephfs/cb_minute/one_minute_stat/{date}.parquet",
+      "reader": "parquet_bars",
       "data_type": "one_minute",
       "path_template": "/data/cephfs/cb_minute/one_minute_stat/{date}.parquet",
       "sample_date": "2024-12-31",
@@ -54,6 +62,7 @@
       "freq": "5min",
       "source": "MinuteParquet",
       "table": "/data/cephfs/minute/five_minute/{date}.parquet",
+      "reader": "parquet_bars",
       "data_type": "five_minute",
       "path_template": "/data/cephfs/minute/five_minute/{date}.parquet",
       "sample_date": "2024-12-31",
@@ -68,6 +77,8 @@
       "name": "adj_factor",
       "source": "AdjustFactor",
       "table": "JYDB.DZ_AdjustingFactor",
+      "reader": "sql_reader",
+      "query_builder": "adjust_factor",
       "field": "adj_factor",
       "params": {}
     },
@@ -77,9 +88,13 @@
       "name": "is_untradable",
       "source": "Untradable",
       "table": "SmartQuant.Untradable",
+      "reader": "sql_reader",
+      "query_builder": "untradable",
       "field": "is_untradable",
       "value_kind": "mask",
-      "params": {}
+      "params": {
+        "default": 0.0
+      }
     },
     "cb.1d.underlying_stk_col": {
       "asset": "cb",
@@ -87,10 +102,11 @@
       "name": "underlying_stk_col",
       "source": "CBStockMap",
       "table": "JYDB.Bond_ConBDBasicInfo",
+      "reader": "cb_stock_map",
       "field": "StockInnerCode",
       "value_kind": "code",
       "params": {
-        "kind": "col"
+        "projection": "axis_position"
       }
     },
     "cb.1d.underlying_stk_inner_code": {
@@ -99,10 +115,11 @@
       "name": "underlying_stk_inner_code",
       "source": "CBStockMap",
       "table": "JYDB.Bond_ConBDBasicInfo",
+      "reader": "cb_stock_map",
       "field": "StockInnerCode",
       "value_kind": "code",
       "params": {
-        "kind": "inner_code"
+        "projection": "inner_code"
       }
     },
     "stk.1d.industry_code.SW2021.L1": {
@@ -111,6 +128,8 @@
       "name": "industry_code.SW2021.L1",
       "source": "ReturnDaily",
       "table": "SmartQuant.ReturnDaily",
+      "reader": "sql_reader",
+      "query_builder": "panel_fields",
       "field": "IndustryCodeNew",
       "value_kind": "code",
       "params": {}
@@ -121,10 +140,13 @@
       "name": "index_weight.CSI300",
       "source": "IndexComponentWeight_Choice",
       "table": "SmartQuant.IndexComponentWeight_Choice",
+      "reader": "sql_reader",
+      "query_builder": "panel_fields",
+      "date_col": "EndDate",
+      "code_col": "SecuInnerCode",
       "field": "Weight",
       "params": {
-        "index_inner_code": 3145,
-        "kind": "index_weight"
+        "index_inner_code": 3145
       }
     },
     "stk.1d.is_member.CSI300": {
@@ -133,11 +155,16 @@
       "name": "is_member.CSI300",
       "source": "IndexComponentWeight_Choice",
       "table": "SmartQuant.IndexComponentWeight_Choice",
+      "reader": "sql_reader",
+      "query_builder": "panel_fields",
+      "date_col": "EndDate",
+      "code_col": "SecuInnerCode",
       "field": "Weight",
       "value_kind": "mask",
       "params": {
         "index_inner_code": 3145,
-        "kind": "index_membership"
+        "constant": 1,
+        "default": 0.0
       }
     }
   }

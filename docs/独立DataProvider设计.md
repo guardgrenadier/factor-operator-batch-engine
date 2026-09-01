@@ -1,5 +1,10 @@
 # 独立 DataProvider 设计
 
+> 注意：2026-08-31 起 `datasets.py` 已拆分为 `readers.py`（具名 Reader）、
+> `query_builders.py`（具名 SQL Query Builder）与 `normalize.py`
+> （LoadNormalizer 唯一规范化边界），详见
+> [`数组布局与数据加载边界设计.md`](数组布局与数据加载边界设计.md)。
+
 - 状态：已实现；公司 HPC 分钟路径的性能基线待在对应环境记录
 - 范围：新 batch pipeline 的正式数据提供者，包含真正的批量 `load_many()`
 

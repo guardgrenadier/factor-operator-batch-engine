@@ -25,8 +25,8 @@ class Catalog:
         """加载配置并构建数据集、逻辑 source 与资产轴数据集索引。"""
 
         payload = load_config(config)
-        if int(payload.get("schema_version", 0)) != 2:
-            raise DataProviderError("data_sources.json schema_version must be 2")
+        if int(payload.get("schema_version", 0)) != 3:
+            raise DataProviderError("data_sources.json schema_version must be 3")
 
         self.backend = backend
         self.duckdb = duckdb
@@ -123,6 +123,8 @@ class Catalog:
                 "data_type": dataset["data_type"],
                 **params,
             },
+            dataset["reader"],
+            dataset["query_builder"],
         )
         return spec, ValueKind(source["kind"])
 
@@ -153,12 +155,30 @@ class Catalog:
         )
 
     def _add_dataset(self, record: Mapping[str, Any]) -> dict[str, Any]:
-        """登记一个物理数据集，推导 id 与坐标列名并记录资产轴数据集。"""
+        """登记一个物理数据集，校验具名 Reader/Query Builder 并推导坐标列名。"""
 
         source = str(record["source"])
         asset = str(record["asset"])
         frequency = str(record["freq"])
         table = str(record["table"])
+        # Reader 与 Query Builder 选择必须显式声明，且只存在于数据集配置。
+        reader = record.get("reader")
+        if reader not in READER_NAMES:
+            raise DataProviderError(
+                f"Dataset {table!r} requires a known reader, got {reader!r}"
+            )
+        query_builder = record.get("query_builder")
+        if reader == "sql_reader":
+            if query_builder not in QUERY_BUILDER_NAMES:
+                raise DataProviderError(
+                    f"Dataset {table!r} requires a known query_builder, "
+                    f"got {query_builder!r}"
+                )
+        elif query_builder is not None:
+            raise DataProviderError(
+                f"Dataset {table!r} declares query_builder but reader "
+                f"{reader!r} does not use one"
+            )
         dataset_id = str(
             record.get("dataset_id")
             or stable_hash(source, asset, frequency, table)[:16]
@@ -169,6 +189,10 @@ class Catalog:
             "frequency": frequency,
             "source": source,
             "table": table,
+            "reader": str(reader),
+            "query_builder": (
+                str(query_builder) if query_builder is not None else None
+            ),
             "date_col": str(
                 record.get("date_col")
                 or ("TradingDay" if source == "IndexQuote" else "DataDate")
@@ -214,7 +238,7 @@ class Catalog:
     ) -> tuple[str, ...]:
         """扫描物理数据集的真实字段清单（分钟 parquet 或 SQL 列）。"""
 
-        if dataset["source"] == "MinuteParquet":
+        if dataset["reader"] == "parquet_bars":
             sample = minute_path(dataset, record.get("sample_date", "2024-12-31"))
             if not sample.exists():
                 raise FileNotFoundError(sample)
@@ -263,6 +287,7 @@ class Catalog:
                     "source": "Fundamental",
                     "table": f"SmartQuant.Fundamental_Item{int(code)}",
                     "dataset_id": f"fundamental:{int(code)}",
+                    "reader": "fundamental",
                 }
             )
             self._add_source(
@@ -305,6 +330,12 @@ def minute_path(dataset: Mapping[str, Any], date: Any) -> Path:
         str(template).format(date=date_key, data_type=dataset.get("data_type") or "")
     )
 
+
+READER_NAMES = frozenset(
+    {"sql_reader", "fundamental", "parquet_bars", "cb_stock_map"}
+)
+
+QUERY_BUILDER_NAMES = frozenset({"panel_fields", "adjust_factor", "untradable"})
 
 DEFAULT_EXCLUDES = {
     "DataDate",

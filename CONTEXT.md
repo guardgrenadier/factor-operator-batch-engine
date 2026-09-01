@@ -54,6 +54,22 @@ _避免使用_：source 注册、全局路由
 能够以兼容查询语义从同一物理数据集中共同读取的一组 SourceBinding。
 _避免使用_：source 缓存、依赖组
 
+**Reader**:
+按 DatasetSpec 声明的具名物理读取器，执行读取并流式返回 RawBatch，不执行最终数组协议。
+_避免使用_：Loader、数据集分派函数
+
+**SQL Query Builder（SQL 查询构造器）**:
+只生成受约束规范 labels SQL 的具名函数，不执行查询、不散布数组。
+_避免使用_：SQL 模板、查询 DSL
+
+**RawBatch**:
+Reader 产出的原始批次，携带 labels/flat/static 坐标列或位置提示与原始值列。
+_避免使用_：中间表、结果集
+
+**LoadNormalizer（加载规范化器）**:
+Source 数组进入 Runtime 前的唯一权威规范化边界，独占坐标校验、散布、dtype、缺失、ValueKind 与默认值。
+_避免使用_：Normalizer 散落各处、Runtime 重复校验
+
 ## Domain
 
 **Asset Scope（任务资产范围）**:
@@ -65,8 +81,12 @@ _避免使用_：不涉及成员语义时称为 Universe、资产列表
 _避免使用_：读取范围、source 空间
 
 **Term Domain**:
-逻辑计算图中一个值的资产、频率、step 和日历身份。
+SourceTerm 值的资产、频率、step 和日历身份，供绑定与读取域计算使用。
 _避免使用_：数组 shape、Output Domain
+
+**ArrayLayout（数组布局）**:
+普通算子值的物理形状（N、S）及不参与兼容性检查的溯源提示，是 OperatorTerm 携带的唯一布局信息。
+_避免使用_：Term Domain（算子值）、业务坐标身份
 
 **Read Domain（读取域）**:
 一个物理分区实际读取的日期和坐标范围，包含 lookback 所需历史。

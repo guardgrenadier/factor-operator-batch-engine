@@ -31,6 +31,7 @@ from .formula import (
     SourceRefExpr,
 )
 from .model import (
+    ArrayLayout,
     CompiledJob,
     CompileError,
     ComputeRequest,
@@ -48,7 +49,7 @@ from .model import (
     TermDomain,
 )
 from .operators import OperatorSpec, VariadicInput, default_operator_registry
-from .operators.domain_rules import numpy_domain
+from .operators.layout_rules import broadcast_layout
 
 
 class Compiler:
@@ -396,19 +397,19 @@ class Compiler:
         input_ids = tuple(self._lower(arg) for arg in input_exprs)
         inputs = tuple(self._terms[term_id] for term_id in input_ids)
         _validate_operator(spec, inputs, input_names, params)
-        rule = spec.domain_rule or numpy_domain
-        domain = rule(tuple(term.domain for term in inputs), params)
+        rule = spec.layout_rule or broadcast_layout
+        layout = rule(tuple(_term_layout(term) for term in inputs), params)
         params = dict(params)
         if spec.name == "get_step" and "step" in params:
-            assert inputs[0].domain is not None
-            params["step"] %= inputs[0].domain.step_count
+            input_layout = _term_layout(inputs[0])
+            assert input_layout is not None
+            params["step"] %= input_layout.step_count
         elif spec.name == "select_by_pos" and "pos" in params:
-            assert inputs[0].domain is not None
+            input_layout = _term_layout(inputs[0])
+            assert input_layout is not None
             axis = params.get("axis", 1)
             length = (
-                inputs[0].domain.asset_count
-                if axis == 1
-                else inputs[0].domain.step_count
+                input_layout.asset_count if axis == 1 else input_layout.step_count
             )
             params["pos"] %= length
         output_kind = _output_kind(spec, inputs)
@@ -421,14 +422,14 @@ class Compiler:
             tuple(zip(input_names, input_ids, strict=True)),
             params,
             output_kind.value,
-            domain,
+            layout,
         )
         return self._intern(
             semantic,
             lambda term_id: OperatorTerm(
                 term_id,
                 output_kind,
-                domain,
+                layout,
                 lookback,
                 semantic,
                 spec.name,
@@ -449,14 +450,15 @@ class Compiler:
         input_ids = tuple(self._lower(arg) for arg in input_exprs)
         inputs = tuple(self._terms[term_id] for term_id in input_ids)
         _validate_operator(spec, inputs, input_names, params)
-        if len(inputs) != 1 or inputs[0].domain is None:
+        input_layout = _term_layout(inputs[0])
+        if len(inputs) != 1 or input_layout is None:
             raise DomainError("Cannot resample a scalar")
         if "source_freq" in params:
             raise CompileError("resample does not accept source_freq")
-        input_term = inputs[0]
-        input_domain = input_term.domain
-        assert input_domain is not None
-        source_freq = input_domain.frequency
+        # 频率是布局上的溯源提示；混合表达式失去唯一频率时必须显式重建。
+        source_freq = input_layout.frequency
+        if source_freq is None:
+            raise DomainError("Cannot resample a value with unknown source frequency")
         target_freq = str(params["target_freq"])
         method = params.get("method")
         if method is None:
@@ -471,13 +473,13 @@ class Compiler:
             )
         if source_freq == "1d":
             raise DomainError("resample cannot convert a daily input")
-        if input_domain.step_count != len(get_freq_step_values(source_freq)):
+        if input_layout.step_count != len(get_freq_step_values(source_freq)):
             raise DomainError(
                 "resample requires the complete standard source step axis"
             )
         # 按目标频率生成 step 分组边界作为运行期参数。
         if target_freq == "1d":
-            groups = np.zeros(input_domain.step_count, dtype=np.intp)
+            groups = np.zeros(input_layout.step_count, dtype=np.intp)
             step_count = 1
         else:
             try:
@@ -498,7 +500,7 @@ class Compiler:
             spec.name,
             input_ids[0],
             runtime_params,
-            replace(input_domain, frequency=target_freq, step_count=step_count),
+            replace(input_layout, frequency=target_freq, step_count=step_count),
         )
 
     def _lower_align_frequency(self, expr: OperatorExpr) -> str:
@@ -513,8 +515,9 @@ class Compiler:
         _validate_operator(spec, inputs, input_names, params)
         if len(inputs) != 1:
             raise CompileError("align_frequency requires one data expression")
-        input_id, input_term = input_ids[0], inputs[0]
-        if input_term.domain is None:
+        input_id = input_ids[0]
+        input_layout = _term_layout(inputs[0])
+        if input_layout is None:
             raise DomainError("Cannot align a scalar frequency")
         params = dict(params)
         if "target_freq" not in params:
@@ -527,14 +530,19 @@ class Compiler:
         method = str(params.pop("method"))
         if params:
             raise CompileError(f"Unknown align_frequency parameters: {sorted(params)}")
-        source_freq = input_term.domain.frequency
+        # 频率是布局上的溯源提示；混合表达式失去唯一频率时必须显式重建。
+        source_freq = input_layout.frequency
+        if source_freq is None:
+            raise DomainError(
+                "Cannot align a value with unknown source frequency"
+            )
         if method != "ffill":
             raise CompileError("align_frequency first version only supports 'ffill'")
         if not is_intraday_freq(source_freq) or not is_intraday_freq(target_freq):
             raise DomainError(
                 "align_frequency only supports coarse intraday to fine intraday"
             )
-        if input_term.domain.step_count != len(get_freq_step_values(source_freq)):
+        if input_layout.step_count != len(get_freq_step_values(source_freq)):
             raise DomainError(
                 "align_frequency requires the complete standard source step axis"
             )
@@ -543,8 +551,8 @@ class Compiler:
             step_index = get_ffill_step_index(source_freq, target_freq)
         except ValueError as exc:
             raise DomainError(str(exc)) from exc
-        output_domain = replace(
-            input_term.domain,
+        output_layout = replace(
+            input_layout,
             frequency=target_freq,
             step_count=len(step_index),
         )
@@ -552,86 +560,68 @@ class Compiler:
             spec.name,
             input_id,
             {"step_index": tuple(step_index.tolist())},
-            output_domain,
+            output_layout,
         )
 
     def _lower_select_asset(self, expr: OperatorExpr) -> str:
         """按稳定代码解析位置并降低为通用 keepdims 选择算子。"""
-        # 选择操作要求输入具有可定位的命名资产轴。
+        # 选择操作要求输入具有唯一无歧义的资产轴来源。
         if len(expr.args) != 1:
             raise CompileError("asset selection requires one data expression")
         input_id = self._lower(expr.args[0])
-        input_term = self._terms[input_id]
-        if input_term.domain is None or input_term.domain.codes is None:
-            raise DomainError("asset selection requires a named asset axis")
+        input_layout = _term_layout(self._terms[input_id])
+        if input_layout is None:
+            raise DomainError("asset selection requires a tensor input")
+        asset_type = input_layout.asset_type
+        if asset_type is None or asset_type not in self._asset_axes:
+            raise DomainError(
+                "asset selection requires a unique, unambiguous asset axis"
+            )
         params = dict(expr.params)
         code = params.pop("code")
         expected_asset_type = params.pop("expected_asset_type", None)
         if params:
             raise CompileError(f"Unknown asset selection parameters: {sorted(params)}")
-        if (
-            expected_asset_type is not None
-            and input_term.domain.asset_type != expected_asset_type
-        ):
+        if expected_asset_type is not None and asset_type != expected_asset_type:
             raise DomainError(
                 f"Selection requires asset type {expected_asset_type!r}, got "
-                f"{input_term.domain.asset_type!r}"
+                f"{asset_type!r}"
             )
         # 编译期将稳定代码解析为位置，运行期仅执行数组切片。
+        codes, _ = self._asset_axes[asset_type]
         try:
-            position = input_term.domain.codes.index(code)
+            position = codes.index(code)
         except ValueError as exc:
             raise DomainError(
                 f"Asset code {code!r} is not present on the input axis"
             ) from exc
-        output_domain = replace(input_term.domain, codes=(code,))
+        output_layout = replace(input_layout, asset_count=1, asset_type=None)
         return self._domain_operator(
             "select_by_pos",
             input_id,
             {"pos": position, "axis": 1, "keepdims": True},
-            output_domain,
+            output_layout,
         )
 
     def _validate_output_domain(
-        self, formula_id: str, domain: TermDomain | None
+        self, formula_id: str, layout: ArrayLayout | None
     ) -> None:
-        """校验输出坐标，仅放行已确认的 singleton 广播。"""
-        # 标量与跨日历输出无法参与目标数组计算。
-        if domain is None:
+        """校验公式输出的物理 shape 能否广播到目标输出域。"""
+        # 标量无法参与目标数组计算；N、S 只按 NumPy 广播规则检查物理形状。
+        if layout is None:
             raise DomainError(f"Formula {formula_id!r} output cannot be scalar")
         target = self._target_domain
-        if domain.calendar != target.calendar:
+        if layout.asset_count not in {1, target.asset_count}:
             raise DomainError(
-                f"Formula {formula_id!r} output calendar does not match target"
+                f"Formula {formula_id!r} output asset dimension "
+                f"{layout.asset_count} cannot broadcast to target "
+                f"{target.asset_count}"
             )
-        # 单资产轴可广播；多资产轴则必须与目标轴完全同一。
-        if domain.asset_count != 1 and (
-            domain.asset_type,
-            domain.codes,
-            domain.axis_fingerprint,
-        ) != (
-            target.asset_type,
-            target.codes,
-            target.axis_fingerprint,
-        ):
+        if layout.step_count not in {1, target.step_count}:
             raise DomainError(
-                f"Formula {formula_id!r} output asset axis does not match target"
-            )
-        # 同频率直接兼容，日频单 step 允许广播到分钟 step 轴。
-        frequency_compatible = domain.frequency == target.frequency or (
-            domain.frequency == "1d"
-            and domain.step_count == 1
-            and is_intraday_freq(target.frequency)
-        )
-        if not frequency_compatible:
-            raise DomainError(
-                f"Formula {formula_id!r} output frequency {domain.frequency!r} "
-                f"does not match target {target.frequency!r}; align it explicitly"
-            )
-        if domain.step_count not in {1, target.step_count}:
-            raise DomainError(
-                f"Formula {formula_id!r} output step count {domain.step_count} "
-                f"cannot broadcast to target step count {target.step_count}"
+                f"Formula {formula_id!r} output step dimension "
+                f"{layout.step_count} cannot broadcast to target "
+                f"{target.step_count}"
             )
 
     def _domain_operator(
@@ -639,9 +629,9 @@ class Compiler:
         name: str,
         input_id: str,
         params: Mapping[str, Any],
-        domain: TermDomain,
+        domain: ArrayLayout,
     ) -> str:
-        """创建或复用一个具有显式输出领域的内部运算符 Term。"""
+        """创建或复用一个具有显式输出布局的内部运算符 Term。"""
         # 参数先规范化，确保同语义内部转换能够命中公共子表达式。
         input_term = self._terms[input_id]
         normalized = {
@@ -732,6 +722,19 @@ def _term_domain(domain: ResolvedOutputDomain) -> TermDomain:
         len(domain.steps),
         domain.calendar,
         domain.axis_fingerprint,
+    )
+
+
+def _term_layout(term: Term) -> ArrayLayout | None:
+    """返回任意 Term 参与布局推导的物理数组布局。"""
+    # SourceTerm 把业务坐标身份降级为纯物理形状与溯源提示。
+    domain = term.domain
+    if domain is None:
+        return None
+    if isinstance(domain, ArrayLayout):
+        return domain
+    return ArrayLayout(
+        domain.asset_count, domain.step_count, domain.asset_type, domain.frequency
     )
 
 

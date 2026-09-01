@@ -1,4 +1,4 @@
-"""算子注册表：集中声明各算子的值类型契约、Lookback 与领域规则。"""
+"""算子注册表：集中声明各算子的值类型契约、Lookback 与布局规则。"""
 
 from __future__ import annotations
 
@@ -25,14 +25,13 @@ from .cross_section import (
     rank,
     winsorize,
 )
-from .domain_rules import (
-    asset_reduce_domain,
-    get_step_domain,
-    lookup_by_col_domain,
-    same_asset_domain,
-    select_by_pos_domain,
-    slice_step_domain,
-    step_reduce_domain,
+from .layout_rules import (
+    asset_reduce_layout,
+    get_step_layout,
+    lookup_by_col_layout,
+    select_by_pos_layout,
+    slice_step_layout,
+    step_reduce_layout,
 )
 from .elementwise import (
     OperatorSpec,
@@ -155,16 +154,16 @@ def default_operator_registry() -> dict[str, OperatorSpec]:
         inputs: tuple[ValueKind, ...] | VariadicInput,
         output: ValueKind | str = ValueKind.NUMERIC,
         lookback: int | Callable[[dict[str, Any]], int] = 0,
-        domain_rule: Callable[..., Any] | None = None,
+        layout_rule: Callable[..., Any] | None = None,
         optional_inputs: tuple[tuple[str, ValueKind], ...] = (),
     ) -> None:
         """向当前注册表加入一项运算符契约。"""
-        # 契约完整记录函数、输入输出类型、回看和领域规则。
+        # 契约完整记录函数、输入输出类型、回看和布局规则。
         registry[name] = OperatorSpec(
-            name, func, inputs, output, lookback, domain_rule, optional_inputs
+            name, func, inputs, output, lookback, layout_rule, optional_inputs
         )
 
-    # 基础数值运算默认使用 NumPy 领域合并规则。
+    # 基础数值运算默认使用 NumPy 广播布局合并规则。
     for name, func in {
         "add": add,
         "subtract": subtract,
@@ -173,7 +172,7 @@ def default_operator_registry() -> dict[str, OperatorSpec]:
     }.items():
         register(name, func, (numeric, numeric))
 
-    register("step_corr", step_corr, (numeric, numeric), numeric, 0, step_reduce_domain)
+    register("step_corr", step_corr, (numeric, numeric), numeric, 0, step_reduce_layout)
 
     # 一元数值及截面变换保持输入领域。
     for name, func in {
@@ -196,10 +195,10 @@ def default_operator_registry() -> dict[str, OperatorSpec]:
         "cs_sum": cs_sum,
         "cs_std": cs_std,
     }.items():
-        register(name, func, (numeric,), numeric, 0, asset_reduce_domain, sample)
+        register(name, func, (numeric,), numeric, 0, asset_reduce_layout, sample)
 
-    register("get_step", get_step, (numeric,), numeric, 0, get_step_domain)
-    register("slice_step", slice_step, (numeric,), numeric, 0, slice_step_domain)
+    register("get_step", get_step, (numeric,), numeric, 0, get_step_layout)
+    register("slice_step", slice_step, (numeric,), numeric, 0, slice_step_layout)
     register("align_frequency", align_frequency, (numeric,))
     register("resample", resample, (numeric,))
 
@@ -214,7 +213,7 @@ def default_operator_registry() -> dict[str, OperatorSpec]:
         "step_last": step_last,
         "step_kurtosis": step_kurtosis,
     }.items():
-        register(name, func, (numeric,), numeric, 0, step_reduce_domain)
+        register(name, func, (numeric,), numeric, 0, step_reduce_layout)
 
     # 比较和逻辑算子输出三态掩码。
     for name, func in {
@@ -254,22 +253,14 @@ def default_operator_registry() -> dict[str, OperatorSpec]:
     }.items():
         register(name, func, (numeric,), numeric, _date_window_lookback)
 
-    register(
-        "neutralize",
-        neutralize,
-        (numeric, numeric),
-        numeric,
-        0,
-        same_asset_domain,
-        sample,
-    )
+    register("neutralize", neutralize, (numeric, numeric), numeric, 0, None, sample)
     register(
         "lookup_by_col",
         lookup_by_col,
         (numeric, code),
         numeric,
         0,
-        lookup_by_col_domain,
+        lookup_by_col_layout,
     )
     register(
         "select_by_pos",
@@ -277,7 +268,7 @@ def default_operator_registry() -> dict[str, OperatorSpec]:
         (numeric,),
         numeric,
         _axis_only_lookback,
-        select_by_pos_domain,
+        select_by_pos_layout,
     )
 
     for name, func in {
@@ -287,9 +278,7 @@ def default_operator_registry() -> dict[str, OperatorSpec]:
         "group_demean": group_demean,
         "group_zscore": group_zscore,
     }.items():
-        register(
-            name, func, (numeric, code), numeric, 0, same_asset_domain, sample_weight
-        )
+        register(name, func, (numeric, code), numeric, 0, None, sample_weight)
 
     # 日内跨日统计分别声明是否收缩 step 轴。
     for name, func in {
@@ -298,16 +287,14 @@ def default_operator_registry() -> dict[str, OperatorSpec]:
         "member_std": member_std,
     }.items():
         register(
-            name, func, (numeric, mask), numeric, 0, asset_reduce_domain, sample_weight
+            name, func, (numeric, mask), numeric, 0, asset_reduce_layout, sample_weight
         )
 
     for name, func in {
         "member_demean": member_demean,
         "member_zscore": member_zscore,
     }.items():
-        register(
-            name, func, (numeric, mask), numeric, 0, same_asset_domain, sample_weight
-        )
+        register(name, func, (numeric, mask), numeric, 0, None, sample_weight)
 
     for name, func in {
         "intraday_flat_mean": intraday_flat_mean,
@@ -319,7 +306,7 @@ def default_operator_registry() -> dict[str, OperatorSpec]:
             (numeric,),
             numeric,
             _intraday_window_lookback,
-            step_reduce_domain,
+            step_reduce_layout,
         )
 
     for name, func in {

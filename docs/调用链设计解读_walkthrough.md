@@ -1,5 +1,11 @@
 # 调用链设计解读：从公式字符串到因子数组
 
+> 注意：2026-08-31 起算子布局与数据加载边界以
+> [`数组布局与数据加载边界设计.md`](数组布局与数据加载边界设计.md) 及
+> [ADR-0001](adr/0001-use-positional-array-layout-for-operators.md) 为准：
+> 本文中 `OperatorSpec.domain_rule`（默认 `numpy_domain`）已由
+> `layout_rule`（默认 `broadcast_layout`）取代，普通算子不再比较业务坐标身份。
+
 - 更新日期：2026-08-19
 - 文档类型：Walkthrough / Explanation（走读式解读）。按真实调用顺序逐步讲解
   每一步的**设计目的**和**数据形态变化**，并全程带一个可运行例子。
