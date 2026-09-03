@@ -11,6 +11,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .data_provider.normalize import normalize_batches
+from .data_provider.readers import RawBatch
 from .domain import ValueKind, stable_hash
 from .execution import ResultStream
 from .formula import SourceRefExpr
@@ -257,10 +259,17 @@ class RepositoryDataProvider:
         ]
         ordinary = [binding for binding in bindings if binding not in factors]
         result = dict(self.base.load_many(ordinary)) if ordinary else {}
-        for binding in factors:
-            factor_id = str(binding.source_spec.params["factor_id"])
-            result[binding.term_id] = self.repository.load(
-                factor_id, binding.read_domain
+        # 已保存因子同样经 LoadNormalizer 授权后才进入 Runtime。
+        if factors:
+            dense = {
+                binding.term_id: self.repository.load(
+                    str(binding.source_spec.params["factor_id"]),
+                    binding.read_domain,
+                )
+                for binding in factors
+            }
+            result.update(
+                normalize_batches(tuple(factors), [RawBatch("dense", dense)])
             )
         return result
 

@@ -2,38 +2,39 @@
   "schema_version": 3,
   "source_tables": [
     {
+      "name": "smartquant_stk_daily",
       "asset": "stk",
       "freq": "1d",
       "source": "ReturnDaily",
       "table": "SmartQuant.ReturnDaily",
       "reader": "sql_reader",
       "query_builder": "panel_fields",
-      "asset_axis": true,
       "date_col": "DataDate",
       "trading_flag_col": "IfTradingDay"
     },
     {
+      "name": "smartquant_cb_daily",
       "asset": "cb",
       "freq": "1d",
       "source": "CBReturnDaily",
       "table": "SmartQuant.CBReturnDaily",
       "reader": "sql_reader",
       "query_builder": "panel_fields",
-      "asset_axis": true,
       "date_col": "DataDate",
       "trading_flag_col": "IfTradingDay"
     },
     {
+      "name": "smartquant_idx_daily",
       "asset": "idx",
       "freq": "1d",
       "source": "IndexQuote",
       "table": "JYDB.QT_IndexQuote",
       "reader": "sql_reader",
       "query_builder": "panel_fields",
-      "asset_axis": true,
       "date_col": "TradingDay"
     },
     {
+      "name": "cephfs_stk_1min",
       "asset": "stk",
       "freq": "1min",
       "source": "MinuteParquet",
@@ -43,9 +44,12 @@
       "path_template": "/data/cephfs/minute/one_minute_stat/{date}.parquet",
       "sample_date": "2024-12-31",
       "date_col": "trading_day",
-      "date_col_type": "date"
+      "date_col_type": "date",
+      "code_col": "security_code",
+      "code_identity": "secu_code"
     },
     {
+      "name": "cephfs_cb_1min",
       "asset": "cb",
       "freq": "1min",
       "source": "MinuteParquet",
@@ -55,9 +59,12 @@
       "path_template": "/data/cephfs/cb_minute/one_minute_stat/{date}.parquet",
       "sample_date": "2024-12-31",
       "date_col": "trading_day",
-      "date_col_type": "date"
+      "date_col_type": "date",
+      "code_col": "security_code",
+      "code_identity": "secu_code"
     },
     {
+      "name": "cephfs_stk_5min",
       "asset": "stk",
       "freq": "5min",
       "source": "MinuteParquet",
@@ -67,7 +74,37 @@
       "path_template": "/data/cephfs/minute/five_minute/{date}.parquet",
       "sample_date": "2024-12-31",
       "date_col": "trading_day",
-      "date_col_type": "date"
+      "date_col_type": "date",
+      "code_col": "security_code",
+      "code_identity": "secu_code"
+    },
+    {
+      "name": "ops_daily",
+      "asset": "stk",
+      "freq": "1d",
+      "source": "OpsData",
+      "table": "/data/cephfs/ops_data/OpsData/{date}.parquet",
+      "reader": "parquet_panel",
+      "path_template": "/data/cephfs/ops_data/OpsData/{date}.parquet",
+      "date_col": "DataDate",
+      "date_col_type": "date",
+      "code_col": "SecuCode",
+      "code_identity": "secu_code",
+      "sample_date": "2026-08-24"
+    },
+    {
+      "name": "ops_intra",
+      "asset": "stk",
+      "freq": "1d",
+      "source": "OpsIntra",
+      "table": "/data/cephfs/ops_data/OpsIntra/{date}.parquet",
+      "reader": "parquet_panel",
+      "path_template": "/data/cephfs/ops_data/OpsIntra/{date}.parquet",
+      "date_col": "DataDate",
+      "date_col_type": "date",
+      "code_col": "SecuCode",
+      "code_identity": "secu_code",
+      "sample_date": "2026-08-24"
     }
   ],
   "sources": {
@@ -96,10 +133,10 @@
         "default": 0.0
       }
     },
-    "cb.1d.underlying_stk_col": {
+    "cb.1d.underlying_stk": {
       "asset": "cb",
       "freq": "1d",
-      "name": "underlying_stk_col",
+      "name": "underlying_stk",
       "source": "CBStockMap",
       "table": "JYDB.Bond_ConBDBasicInfo",
       "reader": "cb_stock_map",
@@ -107,19 +144,6 @@
       "value_kind": "code",
       "params": {
         "projection": "axis_position"
-      }
-    },
-    "cb.1d.underlying_stk_inner_code": {
-      "asset": "cb",
-      "freq": "1d",
-      "name": "underlying_stk_inner_code",
-      "source": "CBStockMap",
-      "table": "JYDB.Bond_ConBDBasicInfo",
-      "reader": "cb_stock_map",
-      "field": "StockInnerCode",
-      "value_kind": "code",
-      "params": {
-        "projection": "inner_code"
       }
     },
     "stk.1d.industry_code.SW2021.L1": {

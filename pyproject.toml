@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "Snapshot-based factor definition, alignment, and materialization engine."
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "bottleneck>=1.6.0",
     "connectorx>=0.4.5",
     "duckdb>=1.5.4",
     "numba>=0.66.0",

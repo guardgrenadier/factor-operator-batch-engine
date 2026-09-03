@@ -196,6 +196,8 @@ def _minute_source(template: str, fields: list[str]) -> dict[str, object]:
         "path_template": template,
         "date_col": "trading_day",
         "date_col_type": "date",
+        "code_col": "security_code",
+        "code_identity": "secu_code",
         "fields": [
             "trading_day",
             "security_code",
@@ -264,7 +266,7 @@ def _projection_provider() -> SmartQuantDataProvider:
                 },
             ],
             "sources": {
-                "cb.1d.underlying_stk_col": {
+                "cb.1d.underlying_stk": {
                     "asset": "cb",
                     "freq": "1d",
                     "source": "CBStockMap",
@@ -348,8 +350,8 @@ def test_explicit_axis_is_validated_and_keeps_caller_order() -> None:
     assert codes.tolist() == [202, 101]
 
 
-def test_wide_and_asset_axis_support_custom_code_col() -> None:
-    """验证宽表与资产轴支持自定义资产编码列。"""
+def test_wide_table_supports_custom_code_col() -> None:
+    """验证特征宽表支持自定义资产编码列（资产轴则固定用注册表参数）。"""
     reader = _CodeColReader()
     provider = SmartQuantDataProvider(
         backend=reader,
@@ -382,9 +384,9 @@ def test_wide_and_asset_axis_support_custom_code_col() -> None:
         )
     )
 
+    # 资产轴来自代码注册表，固定使用 InnerCode，不随数据集配置变化。
     axis_sql = next(sql for sql in reader.sql if "SELECT DISTINCT" in sql)
-    assert "`SecurityCode` AS InnerCode" in axis_sql
-    assert "ORDER BY `SecurityCode`" in axis_sql
+    assert "`InnerCode` AS InnerCode" in axis_sql
     wide_sql = next(
         sql
         for sql in reader.sql
@@ -476,7 +478,7 @@ def test_minute_fields_share_one_parquet_scan(tmp_path, monkeypatch) -> None:
                     **_minute_source(template, ["close", "volume"]),
                 },
             ],
-            "sources": {},
+                        "sources": {},
         },
     )
     batch = FormulaBatch.from_text(
@@ -506,7 +508,7 @@ def test_minute_fields_share_one_parquet_scan(tmp_path, monkeypatch) -> None:
     assert "filename=true" in duckdb.minute_sql
     assert "trading_day" not in duckdb.minute_sql
     assert "CAST(p.security_code" not in duckdb.minute_sql
-    assert "cast_to_type(m.SecuCode, p.security_code)" in duckdb.minute_sql
+    assert 'cast_to_type(m.SecuCode, p."security_code")' in duckdb.minute_sql
     assert "AS DOUBLE" in duckdb.minute_sql
     assert "AS flat_idx" in duckdb.minute_sql
     assert "start_time IN" not in duckdb.minute_sql
@@ -564,7 +566,7 @@ def test_cb_minute_keeps_date_dependent_code_map(tmp_path) -> None:
                     "asset": "cb",
                 },
             ],
-            "sources": {},
+                        "sources": {},
         },
     )
     result = BatchFactorEngine(provider).compute(
@@ -631,7 +633,7 @@ def test_minute_streaming_matches_shape_dtype_values_and_alignment(tmp_path) -> 
                 AXIS_SOURCE,
                 _minute_source(template, ["close", "volume"]),
             ],
-            "sources": {},
+                        "sources": {},
         },
     )
     request = ComputeRequest(
@@ -727,7 +729,7 @@ def test_minute_streaming_rejects_duplicate_coordinates(
                 AXIS_SOURCE,
                 _minute_source(template, ["close"]),
             ],
-            "sources": {},
+                        "sources": {},
         },
     )
     request = ComputeRequest(
@@ -773,7 +775,7 @@ def test_minute_group_fails_when_any_partition_file_is_missing(tmp_path) -> None
                     **_minute_source(template, ["close"]),
                 },
             ],
-            "sources": {},
+                        "sources": {},
         },
     )
     request = ComputeRequest(
@@ -839,10 +841,470 @@ def test_stk_to_cb_mapping_uses_the_frozen_reordered_stock_axis() -> None:
         term
         for term in whole.plan.terms.values()
         if isinstance(term, SourceTerm)
-        and term.source_ref.logical_key == "cb.1d.underlying_stk_col"
+        and term.source_ref.logical_key == "cb.1d.underlying_stk"
     )
     assert mapping.value_kind is ValueKind.CODE
     assert any(
         isinstance(term, OperatorTerm) and term.operator_name == "lookup_by_col"
         for term in whole.plan.terms.values()
+    )
+
+
+def test_include_tables_mounts_only_whitelisted_source_tables(tmp_path) -> None:
+    """验证 include_tables 白名单按 name 挂载指定表，未挂载的分钟源不可解析。"""
+    minute = {**_minute_source(str(tmp_path / "{date}.parquet"), ["close"]), "name": "stk_1min"}
+    axis = {
+        **AXIS_SOURCE,
+        "name": "stk_daily",
+        "fields": [*AXIS_SOURCE["fields"], "ClosePrice"],
+    }
+    config = {
+        "schema_version": 3,
+        "source_tables": [axis, minute],
+        "sources": {},
+    }
+    provider = SmartQuantDataProvider(
+        backend=_Reader(),
+        source_config=config,
+        include_tables=["stk_daily"],
+    )
+
+    assert "stk.1d.ClosePrice" in provider.catalog.sources
+    assert not any(key.startswith("stk.1min.") for key in provider.catalog.sources)
+    with pytest.raises(DataProviderError, match="Unknown source"):
+        provider.describe_many([SourceRefExpr.create("stk.1min.close")])
+
+
+def test_include_tables_filters_named_sources_and_fundamentals(tmp_path) -> None:
+    """验证白名单同时过滤 sources 段逻辑源与基本面自动注册。"""
+    axis = {
+        **AXIS_SOURCE,
+        "name": "stk_daily",
+        "fields": [*AXIS_SOURCE["fields"], "ClosePrice"],
+    }
+    underlying = {
+        "asset": "cb",
+        "freq": "1d",
+        "source": "CBStockMap",
+        "table": "JYDB.Bond_ConBDBasicInfo",
+        "reader": "cb_stock_map",
+        "field": "StockInnerCode",
+        "value_kind": "code",
+        "params": {"projection": "axis_position"},
+    }
+    config = {
+        "schema_version": 3,
+        "source_tables": [axis],
+        "sources": {"cb.1d.underlying_stk": underlying},
+    }
+    # 白名单只含轴表：sources 段的映射源与基本面均不挂载。
+    backend = _Reader()
+    provider = SmartQuantDataProvider(
+        backend=backend, source_config=config, include_tables=["stk_daily"]
+    )
+    assert set(provider.catalog.sources) == {"stk.1d.ClosePrice"}
+    assert not any("Fundamental_ItemCode" in sql for sql in backend.sql)
+
+    # 白名单显式包含 sources 逻辑键与 fundamentals 伪名字时才挂载。
+    backend = _Reader()
+    provider = SmartQuantDataProvider(
+        backend=backend,
+        source_config=config,
+        include_tables=["stk_daily", "cb.1d.underlying_stk", "fundamentals"],
+    )
+    assert set(provider.catalog.sources) == {
+        "stk.1d.ClosePrice",
+        "cb.1d.underlying_stk",
+    }
+    assert any("Fundamental_ItemCode" in sql for sql in backend.sql)
+
+
+def test_include_tables_rejects_unknown_table_names() -> None:
+    """验证白名单中的未知名字直接报错而不是静默忽略。"""
+    with pytest.raises(DataProviderError, match="unknown source table names"):
+        SmartQuantDataProvider(
+            backend=_Reader(),
+            source_config={
+                "schema_version": 3,
+                "source_tables": [{**AXIS_SOURCE, "name": "stk_daily"}],
+                "sources": {},
+            },
+            include_tables=["stk_daily", "nope"],
+        )
+
+
+def test_underlying_stk_projections_share_one_load_group() -> None:
+    """验证位置与 inner_code 两种投影共用同一加载组且只查询一次。"""
+    provider = _projection_provider()
+    request = ComputeRequest(
+        DomainSpec(
+            "20240102",
+            "20240103",
+            {"stk": [33, 11], "cb": [101, 102, 103]},
+            "cb",
+            "1d",
+            1,
+        ),
+        FormulaBatch.from_text(
+            common_inputs="stock_close = source('stk.1d.ClosePrice')",
+            formulas={
+                "alpha": "factor = project_stk_to_cb(stock_close)",
+                "raw": "factor = source('cb.1d.underlying_stk', projection='inner_code')",
+            },
+        ),
+    )
+
+    result = BatchFactorEngine(provider).compute(request)
+
+    # 两种投影是同一逻辑键的两个独立 SourceTerm，不被 DAG 合并。
+    mapping_terms = [
+        term
+        for term in result.plan.terms.values()
+        if isinstance(term, SourceTerm)
+        and term.source_ref.logical_key == "cb.1d.underlying_stk"
+    ]
+    assert len(mapping_terms) == 2
+    assert {
+        dict(term.source_ref.params).get("projection", "axis_position")
+        for term in mapping_terms
+    } == {"axis_position", "inner_code"}
+    # projection 是字段级参数，不拆加载组：整个任务只查询一次映射表。
+    assert (
+        sum("Bond_ConBDBasicInfo" in sql for sql in provider.backend.sql) == 1
+    )
+    # 位置投影经 lookup_by_col 产出股票特征在转债轴上的映射。
+    np.testing.assert_allclose(
+        result.arrays["alpha"],
+        np.array(
+            [
+                [[10.0], [30.0], [float("nan")]],
+                [[11.0], [31.0], [float("nan")]],
+            ]
+        ),
+        equal_nan=True,
+    )
+    # inner_code 投影保留任务无关的原始 StockInnerCode 并沿日期广播。
+    np.testing.assert_allclose(
+        result.arrays["raw"],
+        np.array(
+            [
+                [[11.0], [33.0], [22.0]],
+                [[11.0], [33.0], [22.0]],
+            ]
+        ),
+    )
+
+
+class _SecuCodeReader:
+    """模拟日历、股票资产轴、InnerCode↔SecuCode 映射与 SecuCode 物理表的后端。"""
+
+    def __init__(self) -> None:
+        """初始化 SQL 记录列表。"""
+        self.sql: list[str] = []
+
+    def query(self, sql: str) -> pd.DataFrame:
+        """记录 SQL 并按查询内容返回模拟数据。"""
+        self.sql.append(sql)
+        if "Fundamental_ItemCode" in sql:
+            return pd.DataFrame(columns=["ItemCode", "ItemName"])
+        if "JY_TradingDayNew" in sql:
+            return pd.DataFrame({"TradingDate": ["20240102", "20240103"]})
+        if "InnerCode_SecuCode" in sql:
+            return pd.DataFrame(
+                {"InnerCode": [101, 202], "SecuCode": ["000001", "000002"]}
+            )
+        if "SELECT DISTINCT" in sql:
+            return pd.DataFrame({"InnerCode": [101, 202]})
+        if "FROM `Test`.`SecuDaily`" in sql:
+            assert "IN ('000001', '000002')" in sql
+            return pd.DataFrame(
+                {
+                    "DataDate": ["20240102", "20240102", "20240103"],
+                    "InnerCode": ["000001", "000003", "000002"],
+                    "value_0": [1.0, 9.9, 4.0],
+                }
+            )
+        raise AssertionError(sql)
+
+
+def _ops_dataset(template: str) -> dict[str, object]:
+    """构造 SecuCode 代码列的日频 parquet 面板配置。"""
+    return {
+        "name": "ops_daily",
+        "asset": "stk",
+        "freq": "1d",
+        "source": "OpsData",
+        "table": template,
+        "reader": "parquet_panel",
+        "path_template": template,
+        "asset_axis": False,
+        "date_col": "DataDate",
+        "date_col_type": "date",
+        "code_col": "SecuCode",
+        "code_identity": "secu_code",
+        "fields": ["DataDate", "SecuCode", "close", "ret"],
+    }
+
+
+def _write_ops_parquet(directory, rows_by_date: dict[str, pd.DataFrame]) -> str:
+    """按日期写出日频面板 parquet 文件并返回路径模板。"""
+    for date_key, rows in rows_by_date.items():
+        rows.to_parquet(directory / f"{date_key}.parquet")
+    return str(directory / "{date}.parquet")
+
+
+def test_parquet_panel_reads_secucode_daily_files(tmp_path) -> None:
+    """验证日频 parquet 面板经 SecuCode 映射进入 InnerCode 内部协议。"""
+    template = _write_ops_parquet(
+        tmp_path,
+        {
+            "20240102": pd.DataFrame(
+                {
+                    "DataDate": ["2024-01-02"] * 3,
+                    "SecuCode": ["000001", "000002", "000003"],
+                    "close": [1.0, 2.0, 9.9],
+                    "ret": [0.1, 0.2, 0.9],
+                }
+            ),
+            "20240103": pd.DataFrame(
+                {
+                    "DataDate": ["2024-01-03"] * 2,
+                    "SecuCode": ["000002", "000001"],
+                    "close": [4.0, 3.0],
+                    "ret": [0.4, 0.3],
+                }
+            ),
+        },
+    )
+    backend = _SecuCodeReader()
+    provider = SmartQuantDataProvider(
+        backend=backend,
+        source_config={
+            "schema_version": 3,
+            "source_tables": [AXIS_SOURCE, _ops_dataset(template)],
+                        "sources": {},
+        },
+    )
+    request = ComputeRequest(
+        DomainSpec("20240102", "20240103", {"stk": "all"}, "stk", "1d", 1),
+        FormulaBatch.from_text(
+            common_inputs=(
+                "close = source('stk.1d.close')\nret = source('stk.1d.ret')"
+            ),
+            formulas={"alpha": "factor = close + ret"},
+        ),
+    )
+
+    result = BatchFactorEngine(provider).compute(request)
+
+    # 000003 不在映射表中，被静默丢弃；两个字段同属一个加载组。
+    np.testing.assert_allclose(
+        result.arrays["alpha"],
+        np.array([[[1.1], [2.2]], [[3.3], [4.4]]]),
+    )
+    assert sum("InnerCode_SecuCode" in sql for sql in backend.sql) == 1
+
+
+def test_parquet_panel_fails_when_partition_file_is_missing(tmp_path) -> None:
+    """验证日频面板任一分区文件缺失时加载组整体报错。"""
+    template = _write_ops_parquet(
+        tmp_path,
+        {
+            "20240102": pd.DataFrame(
+                {
+                    "DataDate": ["2024-01-02"],
+                    "SecuCode": ["000001"],
+                    "close": [1.0],
+                    "ret": [0.1],
+                }
+            )
+        },
+    )
+    provider = SmartQuantDataProvider(
+        backend=_SecuCodeReader(),
+        source_config={
+            "schema_version": 3,
+            "source_tables": [AXIS_SOURCE, _ops_dataset(template)],
+                        "sources": {},
+        },
+    )
+    request = ComputeRequest(
+        DomainSpec("20240102", "20240103", {"stk": "all"}, "stk", "1d", 1),
+        FormulaBatch.from_text(
+            common_inputs="close = source('stk.1d.close')",
+            formulas={"alpha": "factor = close"},
+        ),
+    )
+
+    with pytest.raises(DataProviderError, match="Daily parquet file is missing"):
+        BatchFactorEngine(provider).compute(request)
+
+
+def test_panel_fields_translates_secucode_identity() -> None:
+    """验证 secu_code 身份的 SQL 表按映射过滤并翻译回 InnerCode。"""
+    provider = SmartQuantDataProvider(
+        backend=_SecuCodeReader(),
+        source_config={
+            "schema_version": 3,
+            "source_tables": [
+                AXIS_SOURCE,
+                {
+                    "name": "secu_daily",
+                    "asset": "stk",
+                    "freq": "1d",
+                    "source": "SecuDaily",
+                    "table": "Test.SecuDaily",
+                    "reader": "sql_reader",
+                    "query_builder": "panel_fields",
+                    "asset_axis": False,
+                    "date_col": "DataDate",
+                    "code_col": "SecuCode",
+                    "code_identity": "secu_code",
+                    "fields": ["DataDate", "SecuCode", "close"],
+                },
+            ],
+                        "sources": {},
+        },
+    )
+    request = ComputeRequest(
+        DomainSpec("20240102", "20240103", {"stk": "all"}, "stk", "1d", 1),
+        FormulaBatch.from_text(
+            common_inputs="close = source('stk.1d.close')",
+            formulas={"alpha": "factor = close"},
+        ),
+    )
+
+    result = BatchFactorEngine(provider).compute(request)
+
+    # SecuCode 000003 未映射被丢弃；其余按 InnerCode 轴对齐。
+    np.testing.assert_allclose(
+        result.arrays["alpha"],
+        np.array([[[1.0], [np.nan]], [[np.nan], [4.0]]]),
+        equal_nan=True,
+    )
+
+
+def test_code_map_is_frozen_once_per_task_across_partitions(tmp_path) -> None:
+    """验证代码映射随资产轴在编译期冻结，分块执行下只查询一次。"""
+    template = _write_ops_parquet(
+        tmp_path,
+        {
+            "20240102": pd.DataFrame(
+                {
+                    "DataDate": ["2024-01-02"],
+                    "SecuCode": ["000001"],
+                    "close": [1.0],
+                    "ret": [0.1],
+                }
+            ),
+            "20240103": pd.DataFrame(
+                {
+                    "DataDate": ["2024-01-03"],
+                    "SecuCode": ["000001"],
+                    "close": [3.0],
+                    "ret": [0.3],
+                }
+            ),
+        },
+    )
+    backend = _SecuCodeReader()
+    provider = SmartQuantDataProvider(
+        backend=backend,
+        source_config={
+            "schema_version": 3,
+            "source_tables": [AXIS_SOURCE, _ops_dataset(template)],
+                        "sources": {},
+        },
+    )
+    request = ComputeRequest(
+        DomainSpec("20240102", "20240103", {"stk": "all"}, "stk", "1d", 1),
+        FormulaBatch.from_text(
+            common_inputs="close = source('stk.1d.close')",
+            formulas={"alpha": "factor = close"},
+        ),
+    )
+
+    result = BatchFactorEngine(provider).compute(
+        request, options=ExecutionOptions(chunk_size=1)
+    )
+
+    np.testing.assert_allclose(
+        result.arrays["alpha"], np.array([[[1.0], [np.nan]], [[3.0], [np.nan]]]),
+        equal_nan=True,
+    )
+    # 两个日期分区共用编译期冻结的同一份映射快照。
+    assert sum("InnerCode_SecuCode" in sql for sql in backend.sql) == 1
+
+
+def test_secucode_asset_without_registered_code_map_fails(tmp_path) -> None:
+    """验证挂载 secu_code 数据集的资产未登记代码映射时在冻结轴阶段报错。"""
+    template = _write_ops_parquet(
+        tmp_path,
+        {
+            "20240102": pd.DataFrame(
+                {
+                    "DataDate": ["2024-01-02"],
+                    "SecuCode": ["000001"],
+                    "close": [1.0],
+                    "ret": [0.1],
+                }
+            )
+        },
+    )
+    provider = SmartQuantDataProvider(
+        backend=_SecuCodeReader(),
+        source_config={
+            "schema_version": 3,
+            # idx 在注册表中有资产轴但没有代码映射。
+            "source_tables": [{**_ops_dataset(template), "name": "idx_ops", "asset": "idx"}],
+            "sources": {},
+        },
+    )
+    request = ComputeRequest(
+        DomainSpec("20240102", "20240102", {"idx": "all"}, "idx", "1d", 1),
+        FormulaBatch.from_text(
+            common_inputs="close = source('idx.1d.close')",
+            formulas={"alpha": "factor = close"},
+        ),
+    )
+
+    with pytest.raises(DataProviderError, match="no registered code map"):
+        BatchFactorEngine(provider).compute(request)
+
+
+def test_asset_axis_and_code_map_work_without_mounting_axis_table(tmp_path) -> None:
+    """验证轴与代码映射来自注册表：只挂载 ops 面板即可完整计算。"""
+    template = _write_ops_parquet(
+        tmp_path,
+        {
+            "20240102": pd.DataFrame(
+                {
+                    "DataDate": ["2024-01-02"] * 2,
+                    "SecuCode": ["000001", "000002"],
+                    "close": [1.0, 2.0],
+                    "ret": [0.1, 0.2],
+                }
+            )
+        },
+    )
+    provider = SmartQuantDataProvider(
+        backend=_SecuCodeReader(),
+        source_config={
+            "schema_version": 3,
+            "source_tables": [_ops_dataset(template)],
+            "sources": {},
+        },
+    )
+    request = ComputeRequest(
+        DomainSpec("20240102", "20240102", {"stk": "all"}, "stk", "1d", 1),
+        FormulaBatch.from_text(
+            common_inputs="close = source('stk.1d.close')",
+            formulas={"alpha": "factor = close"},
+        ),
+    )
+
+    result = BatchFactorEngine(provider).compute(request)
+
+    np.testing.assert_allclose(
+        result.arrays["alpha"], np.array([[[1.0], [2.0]]])
     )

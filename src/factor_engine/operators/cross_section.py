@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from numba import njit
 
@@ -147,6 +149,180 @@ def member_demean(x, member, sample_mask=None, weight=None):
 def member_zscore(x, member, sample_mask=None, weight=None):
     """按指数成分内均值和标准差计算 zscore。"""
     return _member_stat(x, member, sample_mask=sample_mask, weight=weight, mode=4)
+
+
+def cs_median(x, sample_mask=None):
+    """按 date/step 沿资产轴计算截面中位数。"""
+    return _cs_quantile_kernel(x, _mask_arg(sample_mask), sample_mask is not None, 0.5)
+
+
+def cs_quantile(x, sample_mask=None, q=0.5):
+    """按 date/step 沿资产轴计算截面分位数（线性插值）。"""
+    return _cs_quantile_kernel(
+        x, _mask_arg(sample_mask), sample_mask is not None, float(q)
+    )
+
+
+def cs_var(x, sample_mask=None):
+    """按 date/step 沿资产轴计算截面总体方差（ddof=0）。"""
+    return _cs_moment_kernel(x, _mask_arg(sample_mask), sample_mask is not None, 0)
+
+
+def cs_max(x, sample_mask=None):
+    """按 date/step 沿资产轴计算截面最大值。"""
+    return _cs_minmax_kernel(x, _mask_arg(sample_mask), sample_mask is not None, 0)
+
+
+def cs_min(x, sample_mask=None):
+    """按 date/step 沿资产轴计算截面最小值。"""
+    return _cs_minmax_kernel(x, _mask_arg(sample_mask), sample_mask is not None, 1)
+
+
+def cs_skew(x, sample_mask=None):
+    """按 date/step 沿资产轴计算偏差修正的截面偏度（scipy bias=False）。"""
+    return _cs_moment_kernel(x, _mask_arg(sample_mask), sample_mask is not None, 1)
+
+
+def cs_kurt(x, sample_mask=None):
+    """按 date/step 沿资产轴计算偏差修正的截面 Pearson 峰度（正态为 3）。"""
+    return _cs_moment_kernel(x, _mask_arg(sample_mask), sample_mask is not None, 2)
+
+
+def cs_cv(x, sample_mask=None):
+    """按 date/step 沿资产轴计算截面变异系数（总体标准差除以均值）。"""
+    return _cs_moment_kernel(x, _mask_arg(sample_mask), sample_mask is not None, 3)
+
+
+def cs_mad(x, sample_mask=None):
+    """按 date/step 沿资产轴计算截面中值绝对偏差。"""
+    return _cs_mad_kernel(x, _mask_arg(sample_mask), sample_mask is not None)
+
+
+def cs_entropy(x, sample_mask=None):
+    """按 date/step 沿资产轴计算截面香农熵，负值样本输出 nan。"""
+    return _cs_entropy_kernel(x, _mask_arg(sample_mask), sample_mask is not None)
+
+
+def cs_count(x, sample_mask=None):
+    """按 date/step 沿资产轴计算截面有效值数量。"""
+    return _cs_count_kernel(x, _mask_arg(sample_mask), sample_mask is not None)
+
+
+def cs_cumprod(x, sample_mask=None):
+    """按 date/step 沿资产轴计算截面 (1 + x) 连乘积。"""
+    return _cs_cumprod_kernel(x, _mask_arg(sample_mask), sample_mask is not None)
+
+
+def cs_cov(x, y, sample_mask=None):
+    """按 date/step 沿资产轴计算两输入的截面样本协方差（ddof=1）。"""
+    return _cs_pair(x, y, sample_mask, 0)
+
+
+def cs_corr(x, y, sample_mask=None, method="pearson"):
+    """按 date/step 沿资产轴计算截面相关系数，支持 pearson 与 spearman。"""
+    left, right, mask, has_mask = _cs_pair_inputs(x, y, sample_mask)
+    if method == "spearman":
+        return _cs_spearman_kernel(left, right, mask, has_mask)
+    return _cs_pair_kernel(left, right, mask, has_mask, 1)
+
+
+def cs_beta(x, y, sample_mask=None):
+    """按 date/step 沿资产轴计算 y 对 x 的截面回归斜率。"""
+    return _cs_pair(x, y, sample_mask, 2)
+
+
+def cs_rel_entropy(x, y, sample_mask=None):
+    """按 date/step 沿资产轴计算两输入归一化分布的相对熵（KL 散度）。"""
+    left, right, mask, has_mask = _cs_pair_inputs(x, y, sample_mask)
+    return _cs_rel_entropy_kernel(left, right, mask, has_mask)
+
+
+def cs_min_max_scale(x, sample_mask=None):
+    """按 date/step 用样本内极值把整个截面缩放到 [0, 1]。"""
+    return _cs_min_max_scale_kernel(
+        x, _mask_arg(sample_mask), sample_mask is not None
+    )
+
+
+def cs_gauss_rank(x, sample_mask=None):
+    """按 date/step 对截面百分位排名做 erfinv 高斯化变换。"""
+    return _gauss_rank_kernel(rank(x, sample_mask))
+
+
+def location(x, axis=1):
+    """沿资产或 step 轴填充从 1 开始的序号，输入缺失位置保持缺失。"""
+    length = x.shape[axis]
+    shape = [1, 1, 1]
+    shape[axis] = length
+    sequence = np.arange(1, length + 1, dtype=np.float64).reshape(shape)
+    return np.where(np.isnan(x), np.nan, np.broadcast_to(sequence, x.shape))
+
+
+def umr(x, y):
+    """按 date/step 计算 (x - 截面均值) * y，输入广播对齐。"""
+    left, right = np.broadcast_arrays(
+        np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
+    )
+    return _umr_kernel(left, right)
+
+
+def ols(x, y, sample_mask=None):
+    """按 date/step 沿资产轴回归 y ~ x 并返回残差（等价于中性化）。"""
+    left, right = np.broadcast_arrays(
+        np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
+    )
+    return neutralize(right, left, sample_mask)
+
+
+def rank_add(x, y):
+    """按 date/step 计算两输入截面百分位排名之和。"""
+    return rank(x) + rank(y)
+
+
+def rank_div(x, y):
+    """按 date/step 计算两输入截面百分位排名之商（保护除法）。"""
+    return _rank_divide(rank(x), rank(y))
+
+
+def rank_sub(x, y):
+    """按 date/step 计算两输入截面百分位排名之差。"""
+    return rank(x) - rank(y)
+
+
+def rank_mul(x, y):
+    """按 date/step 计算两输入截面百分位排名之积。"""
+    return rank(x) * rank(y)
+
+
+def _mask_arg(sample_mask):
+    """把缺省样本掩码规范化为 kernel 使用的空数组哨兵。"""
+    return _EMPTY_FLOAT_3D if sample_mask is None else sample_mask
+
+
+def _cs_pair(x, y, sample_mask, mode):
+    """双输入截面统计的公共入口。"""
+    left, right, mask, has_mask = _cs_pair_inputs(x, y, sample_mask)
+    return _cs_pair_kernel(left, right, mask, has_mask, mode)
+
+
+def _cs_pair_inputs(x, y, sample_mask):
+    """广播对齐双输入并规范化样本掩码。"""
+    left, right = np.broadcast_arrays(
+        np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
+    )
+    return left, right, _mask_arg(sample_mask), sample_mask is not None
+
+
+def _rank_divide(x, y):
+    """排名相除的保护除法，分母为零或非有限结果转为 nan。"""
+    left, right = np.broadcast_arrays(
+        np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
+    )
+    out = np.empty(np.broadcast_shapes(left.shape, right.shape), dtype=np.float64)
+    np.divide(left, right, out=out, where=right != 0.0)
+    out[right == 0.0] = np.nan
+    out[np.isinf(out)] = np.nan
+    return out
 
 
 def _group_stat(x, group, *, sample_mask=None, weight=None, mode):
@@ -496,4 +672,475 @@ def _member_transform_kernel(
                 else:
                     value = (arr[t, n, s] - mean) / std
                     out[t, n, s] = value if np.isfinite(value) else np.nan
+    return out
+
+
+@njit(cache=True)
+def _cs_quantile_kernel(arr, sample_mask, has_sample_mask, q):
+    """按 date/step 收集截面有效样本并输出排序后的线性插值分位数。"""
+    out = np.empty((arr.shape[0], 1, arr.shape[2]), dtype=np.float64)
+    buffer = np.empty(arr.shape[1], dtype=np.float64)
+    for t in range(arr.shape[0]):
+        for s in range(arr.shape[2]):
+            mask_step = 0 if has_sample_mask and sample_mask.shape[2] == 1 else s
+            count = 0
+            for n in range(arr.shape[1]):
+                if has_sample_mask and sample_mask[t, n, mask_step] != 1.0:
+                    continue
+                value = arr[t, n, s]
+                if np.isfinite(value):
+                    buffer[count] = value
+                    count += 1
+            if count == 0:
+                out[t, 0, s] = np.nan
+                continue
+            sorted_vals = np.sort(buffer[:count])
+            pos = q * (count - 1)
+            lower = int(pos)
+            frac = pos - lower
+            if lower + 1 < count:
+                out[t, 0, s] = sorted_vals[lower] + frac * (
+                    sorted_vals[lower + 1] - sorted_vals[lower]
+                )
+            else:
+                out[t, 0, s] = sorted_vals[lower]
+    return out
+
+
+@njit(cache=True)
+def _cs_moment_kernel(arr, sample_mask, has_sample_mask, mode):
+    """按 date/step 累计中心矩并输出方差、偏度、峰度或变异系数。"""
+    out = np.empty((arr.shape[0], 1, arr.shape[2]), dtype=np.float64)
+    for t in range(arr.shape[0]):
+        for s in range(arr.shape[2]):
+            mask_step = 0 if has_sample_mask and sample_mask.shape[2] == 1 else s
+            count = 0
+            total = 0.0
+            for n in range(arr.shape[1]):
+                if has_sample_mask and sample_mask[t, n, mask_step] != 1.0:
+                    continue
+                value = arr[t, n, s]
+                if np.isfinite(value):
+                    count += 1
+                    total += value
+            if count == 0:
+                out[t, 0, s] = np.nan
+                continue
+            mean = total / count
+            m2 = 0.0
+            m3 = 0.0
+            m4 = 0.0
+            for n in range(arr.shape[1]):
+                if has_sample_mask and sample_mask[t, n, mask_step] != 1.0:
+                    continue
+                value = arr[t, n, s]
+                if np.isfinite(value):
+                    delta = value - mean
+                    delta_sq = delta * delta
+                    m2 += delta_sq
+                    m3 += delta_sq * delta
+                    m4 += delta_sq * delta_sq
+            m2 /= count
+            m3 /= count
+            m4 /= count
+            out[t, 0, s] = _moment_stat(count, mean, m2, m3, m4, mode)
+    return out
+
+
+@njit(cache=True, inline="always")
+def _moment_stat(count, mean, m2, m3, m4, mode):
+    """由总体中心矩输出方差、偏差修正偏度、Pearson 峰度或变异系数。"""
+    if mode == 0:
+        return m2
+    if mode == 1:
+        if count < 3 or m2 <= 0.0:
+            return np.nan
+        return np.sqrt(count * (count - 1)) / (count - 2) * (m3 / (m2 ** 1.5))
+    if mode == 2:
+        if count < 4 or m2 <= 0.0:
+            return np.nan
+        kurt = (count * count - 1.0) * (m4 / (m2 * m2)) - 3.0 * (count - 1) ** 2
+        return kurt / ((count - 2) * (count - 3)) + 3.0
+    if mean == 0.0 or m2 < 0.0:
+        return np.nan
+    return np.sqrt(m2) / mean
+
+
+@njit(cache=True)
+def _cs_minmax_kernel(arr, sample_mask, has_sample_mask, mode):
+    """按 date/step 输出截面最值，mode 0 为最大、1 为最小。"""
+    out = np.empty((arr.shape[0], 1, arr.shape[2]), dtype=np.float64)
+    for t in range(arr.shape[0]):
+        for s in range(arr.shape[2]):
+            mask_step = 0 if has_sample_mask and sample_mask.shape[2] == 1 else s
+            count = 0
+            best = np.nan
+            for n in range(arr.shape[1]):
+                if has_sample_mask and sample_mask[t, n, mask_step] != 1.0:
+                    continue
+                value = arr[t, n, s]
+                if np.isfinite(value):
+                    if count == 0 or (value > best if mode == 0 else value < best):
+                        best = value
+                    count += 1
+            out[t, 0, s] = best if count else np.nan
+    return out
+
+
+@njit(cache=True)
+def _cs_mad_kernel(arr, sample_mask, has_sample_mask):
+    """按 date/step 计算截面中值绝对偏差（对中位数的绝对偏差再取中位数）。"""
+    out = np.empty((arr.shape[0], 1, arr.shape[2]), dtype=np.float64)
+    values = np.empty(arr.shape[1], dtype=np.float64)
+    deviations = np.empty(arr.shape[1], dtype=np.float64)
+    for t in range(arr.shape[0]):
+        for s in range(arr.shape[2]):
+            mask_step = 0 if has_sample_mask and sample_mask.shape[2] == 1 else s
+            count = 0
+            for n in range(arr.shape[1]):
+                if has_sample_mask and sample_mask[t, n, mask_step] != 1.0:
+                    continue
+                value = arr[t, n, s]
+                if np.isfinite(value):
+                    values[count] = value
+                    count += 1
+            if count == 0:
+                out[t, 0, s] = np.nan
+                continue
+            median = _sorted_median(values, count)
+            for i in range(count):
+                deviations[i] = abs(values[i] - median)
+            out[t, 0, s] = _sorted_median(deviations, count)
+    return out
+
+
+@njit(cache=True, inline="always")
+def _sorted_median(buffer, count):
+    """对缓冲区内前 count 个值排序并返回中位数。"""
+    sorted_vals = np.sort(buffer[:count])
+    if count % 2 == 1:
+        return sorted_vals[count // 2]
+    return (sorted_vals[count // 2 - 1] + sorted_vals[count // 2]) / 2.0
+
+
+@njit(cache=True)
+def _cs_entropy_kernel(arr, sample_mask, has_sample_mask):
+    """按 date/step 计算归一化截面的香农熵，负值或零和输出 nan。"""
+    out = np.empty((arr.shape[0], 1, arr.shape[2]), dtype=np.float64)
+    for t in range(arr.shape[0]):
+        for s in range(arr.shape[2]):
+            mask_step = 0 if has_sample_mask and sample_mask.shape[2] == 1 else s
+            count = 0
+            total = 0.0
+            negative = False
+            for n in range(arr.shape[1]):
+                if has_sample_mask and sample_mask[t, n, mask_step] != 1.0:
+                    continue
+                value = arr[t, n, s]
+                if np.isfinite(value):
+                    count += 1
+                    total += value
+                    negative = negative or value < 0.0
+            if count == 0 or total <= 0.0 or negative:
+                out[t, 0, s] = np.nan
+                continue
+            entropy = 0.0
+            for n in range(arr.shape[1]):
+                if has_sample_mask and sample_mask[t, n, mask_step] != 1.0:
+                    continue
+                value = arr[t, n, s]
+                if np.isfinite(value) and value > 0.0:
+                    p = value / total
+                    entropy -= p * np.log(p)
+            out[t, 0, s] = entropy
+    return out
+
+
+@njit(cache=True)
+def _cs_count_kernel(arr, sample_mask, has_sample_mask):
+    """按 date/step 统计截面有效值数量。"""
+    out = np.empty((arr.shape[0], 1, arr.shape[2]), dtype=np.float64)
+    for t in range(arr.shape[0]):
+        for s in range(arr.shape[2]):
+            mask_step = 0 if has_sample_mask and sample_mask.shape[2] == 1 else s
+            count = 0
+            for n in range(arr.shape[1]):
+                if has_sample_mask and sample_mask[t, n, mask_step] != 1.0:
+                    continue
+                if np.isfinite(arr[t, n, s]):
+                    count += 1
+            out[t, 0, s] = float(count)
+    return out
+
+
+@njit(cache=True)
+def _cs_cumprod_kernel(arr, sample_mask, has_sample_mask):
+    """按 date/step 计算截面 (1 + x) 的连乘积。"""
+    out = np.empty((arr.shape[0], 1, arr.shape[2]), dtype=np.float64)
+    for t in range(arr.shape[0]):
+        for s in range(arr.shape[2]):
+            mask_step = 0 if has_sample_mask and sample_mask.shape[2] == 1 else s
+            count = 0
+            product = 1.0
+            for n in range(arr.shape[1]):
+                if has_sample_mask and sample_mask[t, n, mask_step] != 1.0:
+                    continue
+                value = arr[t, n, s]
+                if np.isfinite(value):
+                    count += 1
+                    product *= 1.0 + value
+            out[t, 0, s] = product if count else np.nan
+    return out
+
+
+@njit(cache=True)
+def _cs_pair_kernel(left, right, sample_mask, has_sample_mask, mode):
+    """按 date/step 累计成对截面矩并输出协方差、相关系数或回归斜率。"""
+    out = np.empty((left.shape[0], 1, left.shape[2]), dtype=np.float64)
+    for t in range(left.shape[0]):
+        for s in range(left.shape[2]):
+            mask_step = 0 if has_sample_mask and sample_mask.shape[2] == 1 else s
+            count = 0
+            sum_x = 0.0
+            sum_y = 0.0
+            sum_xx = 0.0
+            sum_yy = 0.0
+            sum_xy = 0.0
+            for n in range(left.shape[1]):
+                if has_sample_mask and sample_mask[t, n, mask_step] != 1.0:
+                    continue
+                xv = left[t, n, s]
+                yv = right[t, n, s]
+                if np.isfinite(xv) and np.isfinite(yv):
+                    count += 1
+                    sum_x += xv
+                    sum_y += yv
+                    sum_xx += xv * xv
+                    sum_yy += yv * yv
+                    sum_xy += xv * yv
+            out[t, 0, s] = _cs_pair_stat(
+                count, sum_x, sum_y, sum_xx, sum_yy, sum_xy, mode
+            )
+    return out
+
+
+@njit(cache=True, inline="always")
+def _cs_pair_stat(count, sum_x, sum_y, sum_xx, sum_yy, sum_xy, mode):
+    """由截面成对累计矩输出样本协方差（ddof=1）、相关系数或回归斜率。"""
+    if count < 2:
+        return np.nan
+    mean_y = sum_y / count
+    cov_xy = sum_xy - sum_x * mean_y
+    var_x = _population_variance(sum_x, sum_xx, count) * count
+    var_y = _population_variance(sum_y, sum_yy, count) * count
+    if mode == 0:
+        return cov_xy / (count - 1)
+    if mode == 2:
+        return cov_xy / var_x if var_x > 0.0 else np.nan
+    if var_x > 0.0 and var_y > 0.0:
+        return cov_xy / np.sqrt(var_x * var_y)
+    return np.nan
+
+
+@njit(cache=True)
+def _cs_spearman_kernel(left, right, sample_mask, has_sample_mask):
+    """按 date/step 对截面中位秩计算 Spearman 秩相关系数。"""
+    out = np.empty((left.shape[0], 1, left.shape[2]), dtype=np.float64)
+    buffer_x = np.empty(left.shape[1], dtype=np.float64)
+    buffer_y = np.empty(left.shape[1], dtype=np.float64)
+    rank_x = np.empty(left.shape[1], dtype=np.float64)
+    rank_y = np.empty(left.shape[1], dtype=np.float64)
+    for t in range(left.shape[0]):
+        for s in range(left.shape[2]):
+            mask_step = 0 if has_sample_mask and sample_mask.shape[2] == 1 else s
+            count = 0
+            for n in range(left.shape[1]):
+                if has_sample_mask and sample_mask[t, n, mask_step] != 1.0:
+                    continue
+                xv = left[t, n, s]
+                yv = right[t, n, s]
+                if np.isfinite(xv) and np.isfinite(yv):
+                    buffer_x[count] = xv
+                    buffer_y[count] = yv
+                    count += 1
+            if count < 2:
+                out[t, 0, s] = np.nan
+                continue
+            _cs_midrank(buffer_x, count, rank_x)
+            _cs_midrank(buffer_y, count, rank_y)
+            out[t, 0, s] = _cs_midrank_corr(rank_x, rank_y, count)
+    return out
+
+
+@njit(cache=True)
+def _cs_midrank(values, count, out):
+    """对前 count 个值计算中位秩（平局取平均秩），结果写入 out。"""
+    order = np.argsort(values[:count])
+    sorted_vals = values[:count][order]
+    i = 0
+    while i < count:
+        j = i
+        while j + 1 < count and sorted_vals[j + 1] == sorted_vals[i]:
+            j += 1
+        midrank = (i + j) / 2.0 + 1.0
+        for m in range(i, j + 1):
+            out[order[m]] = midrank
+        i = j + 1
+
+
+@njit(cache=True, inline="always")
+def _cs_midrank_corr(rank_x, rank_y, count):
+    """对两组中位秩计算 Pearson 相关系数。"""
+    mean_rank = (count + 1) / 2.0
+    sxx = 0.0
+    syy = 0.0
+    sxy = 0.0
+    for i in range(count):
+        dx = rank_x[i] - mean_rank
+        dy = rank_y[i] - mean_rank
+        sxx += dx * dx
+        syy += dy * dy
+        sxy += dx * dy
+    if sxx > 0.0 and syy > 0.0:
+        return sxy / np.sqrt(sxx * syy)
+    return np.nan
+
+
+@njit(cache=True)
+def _cs_rel_entropy_kernel(left, right, sample_mask, has_sample_mask):
+    """按 date/step 计算两个归一化截面的相对熵（KL 散度）。"""
+    out = np.empty((left.shape[0], 1, left.shape[2]), dtype=np.float64)
+    for t in range(left.shape[0]):
+        for s in range(left.shape[2]):
+            mask_step = 0 if has_sample_mask and sample_mask.shape[2] == 1 else s
+            count = 0
+            total_x = 0.0
+            total_y = 0.0
+            negative = False
+            for n in range(left.shape[1]):
+                if has_sample_mask and sample_mask[t, n, mask_step] != 1.0:
+                    continue
+                xv = left[t, n, s]
+                yv = right[t, n, s]
+                if np.isfinite(xv) and np.isfinite(yv):
+                    count += 1
+                    total_x += xv
+                    total_y += yv
+                    negative = negative or xv < 0.0 or yv < 0.0
+            if count == 0 or total_x <= 0.0 or total_y <= 0.0 or negative:
+                out[t, 0, s] = np.nan
+                continue
+            divergence = 0.0
+            valid = True
+            for n in range(left.shape[1]):
+                if has_sample_mask and sample_mask[t, n, mask_step] != 1.0:
+                    continue
+                xv = left[t, n, s]
+                yv = right[t, n, s]
+                if not (np.isfinite(xv) and np.isfinite(yv)):
+                    continue
+                if xv == 0.0:
+                    continue
+                if yv == 0.0:
+                    valid = False
+                    break
+                p = xv / total_x
+                q = yv / total_y
+                divergence += p * np.log(p / q)
+            out[t, 0, s] = divergence if valid else np.nan
+    return out
+
+
+@njit(cache=True)
+def _cs_min_max_scale_kernel(arr, sample_mask, has_sample_mask):
+    """按 date/step 用样本内极值把整个截面缩放到 [0, 1]，极值相等输出 nan。"""
+    out = np.empty(arr.shape, dtype=np.float64)
+    for t in range(arr.shape[0]):
+        for s in range(arr.shape[2]):
+            mask_step = 0 if has_sample_mask and sample_mask.shape[2] == 1 else s
+            count = 0
+            minimum = np.nan
+            maximum = np.nan
+            for n in range(arr.shape[1]):
+                if has_sample_mask and sample_mask[t, n, mask_step] != 1.0:
+                    continue
+                value = arr[t, n, s]
+                if np.isfinite(value):
+                    if count == 0 or value < minimum:
+                        minimum = value
+                    if count == 0 or value > maximum:
+                        maximum = value
+                    count += 1
+            span = maximum - minimum
+            for n in range(arr.shape[1]):
+                value = arr[t, n, s]
+                if not np.isfinite(value) or count == 0 or span <= 0.0:
+                    out[t, n, s] = np.nan
+                else:
+                    out[t, n, s] = (value - minimum) / span
+    return out
+
+
+@njit(cache=True)
+def _gauss_rank_kernel(ranked):
+    """把 (0, 1] 的百分位排名映射到标准正态分位数。"""
+    out = np.empty(ranked.shape, dtype=np.float64)
+    for index in np.ndindex(ranked.shape):
+        value = ranked[index]
+        if np.isnan(value):
+            out[index] = np.nan
+            continue
+        scaled = (value - 0.5) * 2.0
+        if scaled >= 1.0:
+            scaled = 0.999999
+        elif scaled <= -1.0:
+            scaled = -0.999999
+        out[index] = _erfinv_scalar(scaled)
+    return out
+
+
+@njit(cache=True, inline="always")
+def _erfinv_scalar(y):
+    """用 Winitzki 初值加 Newton 迭代计算误差函数的反函数。"""
+    if y <= -1.0:
+        return -np.inf if y == -1.0 else np.nan
+    if y >= 1.0:
+        return np.inf if y == 1.0 else np.nan
+    coeff = 0.147
+    log_term = np.log(1.0 - y * y)
+    first = 2.0 / (np.pi * coeff) + log_term / 2.0
+    estimate = np.sign(y) * np.sqrt(np.sqrt(first * first - log_term / coeff) - first)
+    # Newton 迭代在 |y| < 1 上快速收敛到机器精度。
+    for _ in range(5):
+        error = math.erf(estimate) - y
+        derivative = 2.0 / np.sqrt(np.pi) * np.exp(-estimate * estimate)
+        estimate -= error / derivative
+    return estimate
+
+
+@njit(cache=True)
+def _umr_kernel(left, right):
+    """按 date/step 计算 (left - 截面均值) * right，缺失向结果传播。"""
+    out = np.empty(left.shape, dtype=np.float64)
+    for t in range(left.shape[0]):
+        for s in range(left.shape[2]):
+            count = 0
+            total = 0.0
+            for n in range(left.shape[1]):
+                value = left[t, n, s]
+                if np.isfinite(value):
+                    count += 1
+                    total += value
+            if count == 0:
+                for n in range(left.shape[1]):
+                    out[t, n, s] = np.nan
+                continue
+            mean = total / count
+            for n in range(left.shape[1]):
+                xv = left[t, n, s]
+                yv = right[t, n, s]
+                if np.isfinite(xv) and np.isfinite(yv):
+                    out[t, n, s] = (xv - mean) * yv
+                else:
+                    out[t, n, s] = np.nan
     return out

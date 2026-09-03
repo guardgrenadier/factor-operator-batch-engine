@@ -312,7 +312,7 @@ operator 和隐式关系 Source：
 project_stk_to_cb(values)
   -> lookup_by_col(
        values,
-       SourceRefExpr("cb.1d.underlying_stk_col"),
+       SourceRefExpr("cb.1d.underlying_stk"),
      )
 ```
 

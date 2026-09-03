@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from ..domain import ValueKind, get_freq_step_count, parse_feature_key, stable_hash
 from ..formula import SourceRefExpr
@@ -21,8 +21,14 @@ class Catalog:
         duckdb: DuckDBBackend,
         config: Mapping[str, Any] | str | Path | None,
         emit: Callable[..., None],
+        include_tables: Iterable[str] | None = None,
     ) -> None:
-        """加载配置并构建数据集、逻辑 source 与资产轴数据集索引。"""
+        """加载配置并构建数据集与逻辑 source 索引。
+
+        include_tables 非空时启用白名单：source_tables 条目按 name 过滤，
+        sources 段按逻辑键过滤，基本面自动注册仅在白名单含伪名字
+        "fundamentals" 时执行；白名单外的名字直接报错。
+        """
 
         payload = load_config(config)
         if int(payload.get("schema_version", 0)) != 3:
@@ -35,9 +41,33 @@ class Catalog:
         # sources 使用列表，只因为基本面允许同名 ItemName 用 data_code 消歧。
         self.datasets: dict[str, dict[str, Any]] = {}
         self.sources: dict[str, list[dict[str, Any]]] = {}
-        self.asset_datasets: dict[str, dict[str, Any]] = {}
 
-        for record in payload.get("source_tables", ()):
+        records = list(payload.get("source_tables", ()))
+        source_records = dict(payload.get("sources", {}))
+        mount_fundamentals = True
+        if include_tables is not None:
+            allowed = {str(name) for name in include_tables}
+            known = (
+                {str(record.get("name")) for record in records}
+                | set(source_records)
+                | {"fundamentals"}
+            )
+            unknown = allowed - known
+            if unknown:
+                raise DataProviderError(
+                    f"include_tables contains unknown source table names: "
+                    f"{sorted(unknown)}"
+                )
+            records = [
+                record for record in records if str(record.get("name")) in allowed
+            ]
+            source_records = {
+                key: record for key, record in source_records.items()
+                if key in allowed
+            }
+            mount_fundamentals = "fundamentals" in allowed
+
+        for record in records:
             dataset = self._add_dataset(record)
             fields = tuple(record.get("fields", ()))
             if not fields:
@@ -62,9 +92,10 @@ class Catalog:
                         SCANNED_FIELD_KINDS.get(name, "numeric"),
                     )
 
-        self._add_fundamentals()
+        if mount_fundamentals:
+            self._add_fundamentals()
 
-        for key, record in payload.get("sources", {}).items():
+        for key, record in source_records.items():
             dataset = self._add_dataset(record)
             self.sources[str(key)] = [
                 {
@@ -82,6 +113,14 @@ class Catalog:
         """目录中逻辑 source 的总数（含同名消歧条目）。"""
 
         return sum(len(items) for items in self.sources.values())
+
+    def needs_code_map(self, asset: str) -> bool:
+        """判断该资产是否有已挂载的 secu_code 身份数据集。"""
+
+        return any(
+            dataset["asset"] == asset and dataset["code_identity"] == "secu_code"
+            for dataset in self.datasets.values()
+        )
 
     def describe(self, ref: SourceRefExpr) -> InputSpec:
         """根据数据源引用解析出供编译使用的语义输入规格。"""
@@ -117,6 +156,7 @@ class Catalog:
                 "date_col": dataset["date_col"],
                 "date_col_type": dataset["date_col_type"],
                 "code_col": dataset["code_col"],
+                "code_identity": dataset["code_identity"],
                 "duckdb_threads": dataset["duckdb_threads"],
                 "trading_flag_col": dataset["trading_flag_col"],
                 "path_template": dataset["path_template"],
@@ -185,6 +225,7 @@ class Catalog:
         )
         dataset = {
             "id": dataset_id,
+            "name": record.get("name"),
             "asset": asset,
             "frequency": frequency,
             "source": source,
@@ -198,6 +239,8 @@ class Catalog:
                 or ("TradingDay" if source == "IndexQuote" else "DataDate")
             ),
             "code_col": str(record.get("code_col") or "InnerCode"),
+            # 代码列中值的物理身份：inner_code（默认）或 secu_code。
+            "code_identity": str(record.get("code_identity", "inner_code")),
             "trading_flag_col": record.get("trading_flag_col"),
             "path_template": record.get("path_template"),
             "data_type": record.get("data_type"),
@@ -205,8 +248,6 @@ class Catalog:
             "duckdb_threads": int(record.get("duckdb_threads", 8)),
         }
         self.datasets.setdefault(dataset_id, dataset)
-        if record.get("asset_axis"):
-            self.asset_datasets[asset] = dataset
         return dataset
 
     def _add_source(
@@ -236,9 +277,9 @@ class Catalog:
     def _scan_fields(
         self, dataset: Mapping[str, Any], record: Mapping[str, Any]
     ) -> tuple[str, ...]:
-        """扫描物理数据集的真实字段清单（分钟 parquet 或 SQL 列）。"""
+        """扫描物理数据集的真实字段清单（parquet 分区或 SQL 列）。"""
 
-        if dataset["reader"] == "parquet_bars":
+        if dataset["path_template"]:
             sample = minute_path(dataset, record.get("sample_date", "2024-12-31"))
             if not sample.exists():
                 raise FileNotFoundError(sample)
@@ -332,7 +373,7 @@ def minute_path(dataset: Mapping[str, Any], date: Any) -> Path:
 
 
 READER_NAMES = frozenset(
-    {"sql_reader", "fundamental", "parquet_bars", "cb_stock_map"}
+    {"sql_reader", "fundamental", "parquet_bars", "parquet_panel", "cb_stock_map"}
 )
 
 QUERY_BUILDER_NAMES = frozenset({"panel_fields", "adjust_factor", "untradable"})

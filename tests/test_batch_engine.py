@@ -618,10 +618,10 @@ def test_stk_to_cb_helper_registers_and_uses_the_mapping_source() -> None:
         asset_codes={"stk": [11, 22], "cb": [101, 102]},
         data={
             "stk.1d.close": stock,
-            "cb.1d.underlying_stk_col": mapping,
+            "cb.1d.underlying_stk": mapping,
         },
         input_specs={
-            "cb.1d.underlying_stk_col": InputSpec(
+            "cb.1d.underlying_stk": InputSpec(
                 "cb", "1d", 1, value_kind=ValueKind.CODE
             )
         },
@@ -646,7 +646,7 @@ def test_stk_to_cb_helper_registers_and_uses_the_mapping_source() -> None:
     np.testing.assert_array_equal(result.arrays["alpha"], stock[:, [1, 0], :])
     assert any(
         isinstance(term, SourceTerm)
-        and term.source_ref.logical_key == "cb.1d.underlying_stk_col"
+        and term.source_ref.logical_key == "cb.1d.underlying_stk"
         for term in result.plan.terms.values()
     )
     assert any(

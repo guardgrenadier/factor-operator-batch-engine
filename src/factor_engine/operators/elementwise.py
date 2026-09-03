@@ -21,7 +21,7 @@ class VariadicInput:
 
 @dataclass(frozen=True)
 class OperatorSpec:
-    """单个算子的契约：函数、输入输出值类型、Lookback 与布局规则。"""
+    """单个算子的契约：函数、输入输出值类型、Lookback、布局规则与参数校验。"""
 
     name: str
     func: Callable[..., Any]
@@ -32,6 +32,8 @@ class OperatorSpec:
         None
     )
     optional_inputs: tuple[tuple[str, ValueKind], ...] = ()
+    # 算子业务参数的编译期校验与规范化钩子；返回规范化后的参数字典。
+    validate_params: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
 
 def add(x, y):
@@ -96,6 +98,118 @@ def sqrt(x):
     """逐元素取平方根。"""
     with np.errstate(invalid="ignore"):
         return np.sqrt(x)
+
+
+def sign(x):
+    """逐元素取符号（1、0、-1），缺失保持 nan。"""
+    return np.sign(x)
+
+
+def power2(x):
+    """逐元素取平方。"""
+    return np.square(x)
+
+
+def power3(x):
+    """逐元素取立方。"""
+    return np.power(x, 3)
+
+
+def curt(x):
+    """逐元素取立方根。"""
+    return np.cbrt(x)
+
+
+def inv(x):
+    """逐元素取倒数，除零或非有限结果转为 nan。"""
+    left, right = _broadcast_inputs(1.0, x)
+    return _divide_kernel(left, right)
+
+
+def exp(x):
+    """逐元素取自然指数。"""
+    with np.errstate(over="ignore", invalid="ignore"):
+        return np.exp(x)
+
+
+def power(x, y):
+    """逐元素取幂，非法结果（如负数的分数次幂）转为 nan。"""
+    with np.errstate(invalid="ignore", over="ignore"):
+        return np.power(x, y)
+
+
+def protected_sqrt(x):
+    """逐元素带符号平方根：sign(x) * sqrt(|x|)。"""
+    with np.errstate(invalid="ignore"):
+        return np.sqrt(np.abs(x)) * np.sign(x)
+
+
+def protected_log(x):
+    """逐元素带符号对数：sign(x) * log(|x| + 1)。"""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return _nan_invalid_log_result(np.log(np.abs(x) + 1.0) * np.sign(x))
+
+
+def sin(x):
+    """逐元素取正弦。"""
+    return np.sin(x)
+
+
+def cos(x):
+    """逐元素取余弦。"""
+    return np.cos(x)
+
+
+def tan(x):
+    """逐元素取正切。"""
+    with np.errstate(invalid="ignore"):
+        return np.tan(x)
+
+
+def sigmoid(x):
+    """逐元素取 sigmoid：1 / (1 + exp(-x))，大绝对值自然饱和到 0/1。"""
+    with np.errstate(over="ignore", invalid="ignore"):
+        left, right = _broadcast_inputs(1.0, 1.0 + np.exp(-x))
+        return _divide_kernel(left, right)
+
+
+def hardsigmoid(x):
+    """逐元素取分段线性近似 sigmoid：clip((x + 1) / 2, 0, 1)。"""
+    return np.clip((x + 1.0) / 2.0, 0.0, 1.0)
+
+
+def leakyrelu(x, alpha=0.1):
+    """逐元素 Leaky ReLU：x > 0 时为 x，否则为 alpha * x。"""
+    return np.where(x > 0, x, alpha * x)
+
+
+def gelu(x):
+    """逐元素取 tanh 近似的 GELU。"""
+    return (
+        x
+        * 0.5
+        * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * np.power(x, 3))))
+    )
+
+
+def series_min(x, y):
+    """逐元素取两者较小值，任一输入缺失输出缺失。"""
+    return np.minimum(x, y)
+
+
+def series_max(x, y):
+    """逐元素取两者较大值，任一输入缺失输出缺失。"""
+    return np.maximum(x, y)
+
+
+def one(x):
+    """逐元素常数 1，输入缺失位置保持缺失。"""
+    return np.where(np.isnan(x), np.nan, 1.0)
+
+
+def if_then_else(x, y, o1, o2):
+    """按 x >= y 的三值比较结果选择 o1 或 o2，条件缺失输出缺失。"""
+    return where(greater_equal(x, y), o1, o2)
 
 
 def _compare(x, y, mode):

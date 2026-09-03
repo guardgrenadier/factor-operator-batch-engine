@@ -37,11 +37,35 @@ def panel_fields(request: ReaderRequest, aliases: Mapping[str, str]) -> Built:
         field = str(binding.source_spec.field or binding.source_spec.name)
         select.append(f"{sql_identifier(field)} AS {alias}")
         fields.append(field)
-    # 构造读取域的日期与资产过滤条件。
+    # 构造读取域的日期与资产过滤条件；secu_code 身份的表按代码映射
+    # 把 InnerCode 读取域翻译成 SecuCode 过滤值（结果由 Reader 翻译回）。
+    if str(first.params.get("code_identity", "inner_code")) == "secu_code":
+        code_map = request.code_maps.get(first.asset)
+        if code_map is None:
+            raise _error(f"secu_code dataset {first.table!r} requires a code map")
+        wanted = {int(code) for code in domain.codes}
+        secucodes = sorted(
+            {
+                str(secu)
+                for secu, inner in zip(
+                    code_map["SecuCode"],
+                    code_map["InnerCode"],
+                )
+                if int(inner) in wanted
+            }
+        )
+        code_filter = (
+            f"{sql_identifier(code_col)} IN "
+            f"({', '.join(sql_literal(value) for value in secucodes)})"
+            if secucodes
+            else "1 = 0"
+        )
+    else:
+        code_filter = f"{sql_identifier(code_col)} IN ({integer_list(domain.codes)})"
     filters = [
         f"{sql_identifier(date_col)} BETWEEN {sql_literal(domain.dates[0])} "
         f"AND {sql_literal(domain.dates[-1])}",
-        f"{sql_identifier(code_col)} IN ({integer_list(domain.codes)})",
+        code_filter,
     ]
     trading_col = first.params.get("trading_flag_col")
     if trading_col:

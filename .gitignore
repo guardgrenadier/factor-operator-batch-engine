@@ -37,3 +37,7 @@ Thumbs.db
 
 # Local investigation notebook; do not version control.
 /sqlserver取数精度问题说明.ipynb
+
+# 外部项目参考材料（源算子目录与取数手册），仅供移植对照，不纳入版本控制。
+/docs/all_operators.py
+/docs/DataProvider使用手册.md

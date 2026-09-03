@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+import pandas as pd
 
 from ..domain import get_step_values, normalize_date_key, stable_hash
 from ..formula import SourceRefExpr
@@ -28,7 +29,37 @@ from .backend import (
     sql_table,
 )
 from .catalog import Catalog
-from .readers import load_group
+from .readers import load_group, query_code_map
+
+
+# 任务资产轴与 InnerCode↔SecuCode 映射是本环境的固定物理事实，按资产
+# 显式登记在此；它们不属于可挂载数据源配置，也不随 include_tables 过滤。
+# 未登记的资产类型在 asset_codes/代码映射冻结时直接报错。
+_ASSET_AXES: dict[str, dict[str, Any]] = {
+    "stk": {
+        "table": "SmartQuant.ReturnDaily",
+        "date_col": "DataDate",
+        "code_col": "InnerCode",
+        "trading_flag_col": "IfTradingDay",
+    },
+    "cb": {
+        "table": "SmartQuant.CBReturnDaily",
+        "date_col": "DataDate",
+        "code_col": "InnerCode",
+        "trading_flag_col": "IfTradingDay",
+    },
+    "idx": {
+        "table": "JYDB.QT_IndexQuote",
+        "date_col": "TradingDay",
+        "code_col": "InnerCode",
+        "trading_flag_col": None,
+    },
+}
+
+_CODE_MAPS: dict[str, dict[str, Any]] = {
+    "stk": {"table": "SmartQuant.InnerCode_SecuCode"},
+    "cb": {"from_asset_axis": True},
+}
 
 
 class SmartQuantDataProvider:
@@ -40,8 +71,15 @@ class SmartQuantDataProvider:
         backend: Any | None = None,
         duckdb: DuckDBBackend | None = None,
         source_config: Mapping[str, Any] | str | Path | None = None,
+        include_tables: Sequence[str] | None = None,
     ) -> None:
-        """初始化后端、诊断列表并加载数据集目录。"""
+        """初始化后端、诊断列表并加载数据集目录。
+
+        include_tables 非空时启用白名单：source_tables 条目按 name 过滤，
+        sources 段按逻辑键过滤，基本面自动注册需显式包含伪名字
+        "fundamentals"（例如只挂 smartquant_stk_daily/smartquant_cb_daily
+        日行情、不挂分钟 parquet）。
+        """
 
         self.backend = backend or OceanBaseBackend()
         self.duckdb = duckdb or DuckDBBackend()
@@ -49,7 +87,14 @@ class SmartQuantDataProvider:
         self._calendar: np.ndarray | None = None
         self._axes: dict[str, np.ndarray] = {}
         self._axis_requests: dict[str, tuple[Any, ...]] = {}
-        self.catalog = Catalog(self.backend, self.duckdb, source_config, self._event)
+        self._code_maps: dict[str, pd.DataFrame] = {}
+        self.catalog = Catalog(
+            self.backend,
+            self.duckdb,
+            source_config,
+            self._event,
+            include_tables,
+        )
         self.catalog_fingerprint = self.catalog.fingerprint
         self._event(
             operation="catalog_snapshot",
@@ -97,7 +142,7 @@ class SmartQuantDataProvider:
         """解析并冻结某资产类型的有序任务资产范围（资产代码轴）。"""
 
         try:
-            dataset = self.catalog.asset_datasets[asset_type]
+            axis_spec = _ASSET_AXES[asset_type]
         except KeyError as exc:
             raise DomainError(f"Unknown asset type {asset_type!r}") from exc
         if not dates:
@@ -110,29 +155,29 @@ class SmartQuantDataProvider:
                 raise DomainError(f"Asset axis {asset_type!r} is already frozen")
             self._event(
                 operation="asset_axis",
-                dataset=dataset["table"],
+                dataset=axis_spec["table"],
                 status="ok",
                 cache_hit=True,
                 physical_queries=0,
             )
             return self._axes[asset_type]
         # 构造日期、交易日标志与显式代码的过滤条件。
-        code_col = str(dataset.get("code_col", "InnerCode"))
+        code_col = str(axis_spec["code_col"])
         filters = [
-            f"{sql_identifier(dataset['date_col'])} BETWEEN {sql_literal(date_keys[0])} "
+            f"{sql_identifier(axis_spec['date_col'])} BETWEEN {sql_literal(date_keys[0])} "
             f"AND {sql_literal(date_keys[-1])}"
         ]
         explicit = None if isinstance(selector, str) else tuple(selector)
-        if dataset["trading_flag_col"]:
-            filters.append(f"{sql_identifier(dataset['trading_flag_col'])} = 1")
+        if axis_spec["trading_flag_col"]:
+            filters.append(f"{sql_identifier(axis_spec['trading_flag_col'])} = 1")
         if explicit is not None:
             filters.append(f"{sql_identifier(code_col)} IN ({integer_list(explicit)})")
         # 查询资产轴代码并校验显式选择无缺失，最后冻结结果。
         rows = self._query(
             f"SELECT DISTINCT {sql_identifier(code_col)} AS InnerCode "
-            f"FROM {sql_table(dataset['table'])} "
+            f"FROM {sql_table(axis_spec['table'])} "
             f"WHERE {' AND '.join(filters)} ORDER BY {sql_identifier(code_col)}",
-            dataset["table"],
+            axis_spec["table"],
             "asset_axis",
         )
         found = [int(value) for value in rows[column(rows, "InnerCode")].tolist()]
@@ -148,7 +193,36 @@ class SmartQuantDataProvider:
             raise DomainError(f"Asset axis {asset_type!r} is empty")
         self._axis_requests[asset_type] = request
         self._axes[asset_type] = axis
+        self._freeze_code_map(asset_type)
         return axis
+
+    def _freeze_code_map(self, asset_type: str) -> None:
+        """在资产轴冻结时一并冻结该资产的 InnerCode↔SecuCode 映射。
+
+        只当该资产有已挂载的 secu_code 数据源时才发起查询；映射来源
+        由代码注册表显式登记，未登记的资产直接报错。映射在整个任务
+        期间保持不变，Reader 从冻结上下文取用而不再逐次查询。
+        """
+        if asset_type in self._code_maps:
+            return
+        if not self.catalog.needs_code_map(asset_type):
+            return
+        try:
+            map_spec = _CODE_MAPS[asset_type]
+        except KeyError as exc:
+            raise DataProviderError(
+                f"Asset {asset_type!r} has secu_code datasets but no "
+                "registered code map"
+            ) from exc
+        date_keys, _ = self._axis_requests[asset_type]
+        self._code_maps[asset_type] = query_code_map(
+            self.backend,
+            map_spec,
+            _ASSET_AXES[asset_type],
+            date_keys,
+            self._axes[asset_type].tolist(),
+            self._event,
+        )
 
     def describe_many(
         self, source_refs: Sequence[SourceRefExpr]
@@ -214,6 +288,7 @@ class SmartQuantDataProvider:
                 self.backend,
                 self.duckdb,
                 self._axes,
+                self._code_maps,
                 self._event,
             )
         except DataProviderError:

@@ -97,6 +97,18 @@ def slice_step_layout(
     return replace(layout, step_count=count)
 
 
+def location_layout(
+    layouts: tuple[ArrayLayout | None, ...], params: Mapping[str, Any]
+) -> ArrayLayout:
+    """位置序号只允许在资产或 step 轴上生成，日期轴因分区执行被拒绝。"""
+    layout = broadcast_layout(layouts, params)
+    if layout is None:
+        raise _error("location requires at least one tensor layout")
+    if params.get("axis", 1) == 0:
+        raise _error("location cannot index the partitioned date axis")
+    return layout
+
+
 def lookup_by_col_layout(
     layouts: tuple[ArrayLayout | None, ...], _: Mapping[str, Any]
 ) -> ArrayLayout:

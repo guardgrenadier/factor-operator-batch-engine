@@ -249,7 +249,7 @@ class Compiler:
                 "lookup_by_col",
                 (
                     args[0],
-                    SourceRefExpr.create("cb.1d.underlying_stk_col"),
+                    SourceRefExpr.create("cb.1d.underlying_stk"),
                 ),
                 span=expr.span,
             )
@@ -802,13 +802,13 @@ def _canonical_call(
     return (
         tuple(inputs[name] for name in names),
         (None,) * len(present_required) + present_optional,
-        _canonical_parameters(spec.name, params),
+        _canonical_parameters(spec, params),
     )
 
 
-def _canonical_parameters(name: str, params: Mapping[str, Any]) -> dict[str, Any]:
+def _canonical_parameters(spec: OperatorSpec, params: Mapping[str, Any]) -> dict[str, Any]:
     """在 Compiler 边界把 Runtime 配置规范为可直接计算的值。"""
-    # 先做稳定可哈希的通用规范化，再逐项应用领域与取值约束。
+    # 先做稳定可哈希的通用规范化，再逐项应用共享结构参数的取值约束。
     result = {key: _normalize_value(value) for key, value in sorted(params.items())}
     try:
         if "periods" in result:
@@ -831,13 +831,14 @@ def _canonical_parameters(name: str, params: Mapping[str, Any]) -> dict[str, Any
         and result["min_periods"] > result["window"]
     ):
         raise CompileError("min_periods must not exceed window")
-    # winsorize 的截断边界必须落在有序概率区间内。
-    if name == "winsorize":
-        lower = float(result.get("lower", 0.01))
-        upper = float(result.get("upper", 0.99))
-        if not 0.0 <= lower <= upper <= 1.0:
-            raise CompileError("winsorize requires 0 <= lower <= upper <= 1")
-        result.update(lower=lower, upper=upper)
+    # 算子的业务取值约束由算子契约自己校验，Compiler 不感知具体算子语义。
+    if spec.validate_params is not None:
+        try:
+            result = spec.validate_params(result)
+        except (TypeError, ValueError) as exc:
+            raise CompileError(
+                f"Invalid parameters for operator {spec.name!r}: {exc}"
+            ) from exc
     return result
 
 

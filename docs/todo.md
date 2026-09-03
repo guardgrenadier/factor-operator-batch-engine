@@ -517,3 +517,29 @@ Domain 体系的核心承诺是"非法域在编译期响亮报错、绝不静默
 - Catalog 内部与 loader 中不再出现 dataset/source 记录的字符串索引访问；
 - 日期/代码/交易日标志过滤只存在一处构造逻辑；
 - `tests/test_smartquant_provider.py` 与 `tests/test_data_provider_backend.py` 全量通过，物理查询次数诊断不变。
+
+## 14. 把 `get_step`/`select_by_pos` 的负索引归一化移出 Compiler
+
+### 目标
+
+消除 `_lower_operator()` 中最后两处按算子名特判的参数归一化，使 Compiler 对普通算子完全通用；这与算子参数校验迁入 `OperatorSpec.validate_params` 是同一类收敛。
+
+### 当前状态
+
+- `compiler.py` `_lower_operator()` 对 `get_step`/`select_by_pos` 硬编码负索引归一化：`params["step"] %= step_count`、`params["pos"] %= length`；
+- 该归一化参与语义身份：`get_step(x, -1)` 与 `get_step(x, S-1)` 必须命中同一 CSE Term，因此不能推迟到 Runtime kernel 处理；
+- 归一化依赖输入布局（`step_count`/`asset_count`），必须在 layout rule 推导之后执行，现有 `validate_params(params)` 钩子拿不到布局，不能直接复用；
+- 其余算子专属逻辑已有明确归属：业务参数校验在 `OperatorSpec.validate_params`，显式坐标变换走文档化的专属 lowering（resample/align_frequency/__select_asset），helper 按名展开属于公式语言定义。
+
+### 实现要点
+
+- 候选方案 A：把 `validate_params` 升级为 `validate_params(params, layouts)`，使其能看到输入布局；缺点是纯参数校验钩子的签名变重；
+- 候选方案 B：新增可选的"布局后参数归一化"钩子（如 `normalize_params(params, input_layout)`），与 `validate_params` 职责分开；
+- 无论哪个方案，`get_step_layout`/`select_by_pos_layout` 的位置越界校验与参数归一化应保持同一处语义来源，避免两处各自实现取模；
+- 顺手评估 `_configuration_literal()` 中硬编码 `neg` 的负数配置字面量是否应上移到公式层。
+
+### 验收标准
+
+- `_lower_operator()` 不再出现按算子名的参数特判；
+- `get_step(x, -1)` 与 `get_step(x, S-1)` 产生相同 semantic identity，越界位置仍在编译期报错；
+- 全部现有测试通过，行为无变化。

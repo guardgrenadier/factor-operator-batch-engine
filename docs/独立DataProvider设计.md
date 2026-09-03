@@ -127,9 +127,9 @@ reader type
 物理 `SourceSpec`。物理位置变化不得改变等价 LogicalPlan 的身份。
 
 `SourceSpec` 继续保持当前职责和字段范围。数据集级批量请求由 Provider 内部临时
-组装，不扩展成新的公共计划对象。`cb.1d.underlying_stk_col` 只在 Catalog
-中声明原生 `cb` 轴、`CODE` 值类型和 `kind="col"`；不增加
-`reference_asset` 字段。引用的股票轴是 `_cb_stock_map()` 的固定业务规则。
+组装，不扩展成新的公共计划对象。`cb.1d.underlying_stk` 只在 Catalog
+中声明原生 `cb` 轴、`CODE` 值类型和 `projection="axis_position"`；不增加
+`reference_asset` 字段。引用的股票轴是 `cb_stock_map` Reader 的固定业务规则。
 
 ## 5. 首期数据范围
 
@@ -200,9 +200,10 @@ cache hit、物理查询/scan 次数、行数或字节数、耗时和错误 Sour
 
 ## 9. 股票到转债的任务级 mapping
 
-关系 Source `cb.1d.underlying_stk_col` 的原生轴是 `cb`。Provider 按当前
-转债 ReadDomain 读取原始正股 InnerCode，`_cb_stock_map()` 内固定使用当前任务
-实例的 `axes["stk"]` 生成列位置。该规则不抽象为可配置引用资产类型。
+关系 Source `cb.1d.underlying_stk` 的原生轴是 `cb`。Provider 按当前
+转债 ReadDomain 读取原始正股 InnerCode，`cb_stock_map` Reader 内固定使用当前任务
+实例的 `axes["stk"]` 生成列位置（`axis_position` 投影）；`projection="inner_code"`
+时保留任务无关的原始 StockInnerCode。该规则不抽象为可配置引用资产类型。
 正股不在任务股票轴时，列位置为 NaN。
 
 Provider 只产生任务内的位置数据；股票到转债的 gather 仍由通用
