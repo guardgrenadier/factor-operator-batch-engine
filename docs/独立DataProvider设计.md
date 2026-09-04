@@ -99,17 +99,24 @@ Catalog 构建规则。每个任务启动时重新扫描配置的数据集字段
 只存在于任务内存中的 Catalog；暂不持久化解析结果，但记录其
 fingerprint 用于诊断和复现。
 
+Catalog 在任何字段扫描或物理查询前先执行最小 `validate_config()`：校验 schema、
+logical key 与 asset/freq/name、ValueKind、Reader/Query Builder、code identity、parquet
+路径及重复 dataset ID 的物理属性一致性。公式 semantic params 可以改变已声明的数据
+语义参数，但不能覆盖 date/code/path 等物理数据集参数。
+
 配置只保存物理位置和单数据集差异：Source 表和路径、资产轴使用的行情表和日期列，
 以及 `source_tables[].exclude_fields` 这类单表例外。稳定字段的 `ValueKind` 和通用排除
 规则位于 [`data_provider/catalog.py`](../src/factor_engine/data_provider/catalog.py)，
-特殊 Source SQL 约定位于 [`data_provider/datasets.py`](../src/factor_engine/data_provider/datasets.py)，
-共用 SQL/DuckDB 能力位于
+特殊 Source 的具名读取位于
+[`data_provider/readers.py`](../src/factor_engine/data_provider/readers.py)，规范 SQL 构造位于
+[`data_provider/query_builders.py`](../src/factor_engine/data_provider/query_builders.py)，共用 SQL/DuckDB 能力位于
 [`data_provider/backend.py`](../src/factor_engine/data_provider/backend.py)，不把每个固定列
 重复展开成配置协议。`SmartQuantDataProvider` 只协调任务状态和五个 Provider 方法。
 
-正式实现内部按职责分为 `catalog.py`、`backend.py`、`datasets.py`、`normalize.py`
-和薄 `smartquant.py`。旧 `legacy/data/router.py`、`legacy/data/smartquant.py` 与 FeatureArray
-只属于 legacy 研究层，不进入正式 Provider 依赖链。
+正式实现内部按职责分为 `catalog.py`、`backend.py`、`readers.py`、
+`query_builders.py`、`normalize.py` 和薄 `smartquant.py`。旧
+`legacy/data/router.py`、`legacy/data/smartquant.py` 与 FeatureArray 只属于 legacy 研究层，
+不进入正式 Provider 依赖链。
 
 Catalog 对每个逻辑 Source 至少描述：
 

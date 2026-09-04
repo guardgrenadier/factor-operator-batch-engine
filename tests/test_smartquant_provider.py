@@ -23,6 +23,7 @@ from factor_engine import (
     ValueKind,
 )
 from factor_engine.data_provider.backend import DuckDBBackend
+from factor_engine.data_provider.catalog import load_config, validate_config
 from factor_engine.domain import get_freq_step_count, get_freq_step_values
 
 
@@ -233,6 +234,106 @@ def _legacy_minute_arrays(
                     value if np.isfinite(value) else np.nan
                 )
     return result
+
+
+def test_catalog_config_validation_rejects_silent_misbindings() -> None:
+    """验证 Catalog 在外部 I/O 前拒绝逻辑键、代码身份和数据集冲突。"""
+    source = {
+        "asset": "stk",
+        "freq": "1d",
+        "source": "Test",
+        "table": "Schema.Table",
+        "reader": "sql_reader",
+        "query_builder": "panel_fields",
+        "field": "value",
+    }
+    cases = [
+        (
+            {
+                "schema_version": 3,
+                "source_tables": [],
+                "sources": {"stk.1d.value": {**source, "asset": "cb"}},
+            },
+            "asset/freq must match",
+        ),
+        (
+            {
+                "schema_version": 3,
+                "source_tables": [
+                    {**source, "fields": ["value"], "code_identity": "secu_cdoe"}
+                ],
+                "sources": {},
+            },
+            "invalid code_identity",
+        ),
+        (
+            {
+                "schema_version": 3,
+                "source_tables": [],
+                "sources": {
+                    "stk.1d.a": {
+                        **source,
+                        "dataset_id": "same",
+                        "field": "a",
+                    },
+                    "stk.1d.b": {
+                        **source,
+                        "dataset_id": "same",
+                        "table": "Schema.Other",
+                        "field": "b",
+                    },
+                },
+            },
+            "conflicts with dataset_id",
+        ),
+    ]
+
+    validate_config(load_config(None))
+    for config, message in cases:
+        with pytest.raises(DataProviderError, match=message):
+            validate_config(config)
+
+    shared = {
+        "schema_version": 3,
+        "source_tables": [
+            {
+                **source,
+                "fields": ["DataDate", "InnerCode"],
+                "trading_flag_col": "IfTradingDay",
+            }
+        ],
+        "sources": {"stk.1d.value": source},
+    }
+    provider = SmartQuantDataProvider(backend=_Reader(), source_config=shared)
+    spec, _ = provider.catalog.bind(SourceRefExpr.create("stk.1d.value"))
+    assert spec.params["trading_flag_col"] == "IfTradingDay"
+
+
+def test_formula_cannot_override_catalog_physical_parameters() -> None:
+    """验证 Source semantic params 不能篡改 Catalog 的物理坐标配置。"""
+    key = "stk.1d.value"
+    provider = SmartQuantDataProvider(
+        backend=_Reader(),
+        source_config={
+            "schema_version": 3,
+            "source_tables": [],
+            "sources": {
+                key: {
+                    "asset": "stk",
+                    "freq": "1d",
+                    "source": "Test",
+                    "table": "Schema.Table",
+                    "reader": "sql_reader",
+                    "query_builder": "panel_fields",
+                    "field": "value",
+                }
+            },
+        },
+        include_tables=[key],
+    )
+
+    with pytest.raises(DataProviderError, match="cannot override physical"):
+        provider.describe_many([SourceRefExpr.create(key, date_col="WrongDate")])
 
 
 def _projection_provider() -> SmartQuantDataProvider:

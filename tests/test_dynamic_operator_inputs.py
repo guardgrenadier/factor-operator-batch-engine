@@ -16,6 +16,11 @@ from factor_engine import (
     OperatorTerm,
     ValueKind,
 )
+from factor_engine.operators import (
+    OperatorSpec,
+    default_operator_registry,
+    validate_operator_registry,
+)
 
 
 def _provider() -> MemoryDataProvider:
@@ -104,3 +109,54 @@ def test_dynamic_input_value_kind_is_checked_at_compile_time() -> None:
         BatchFactorEngine(_provider()).compile(
             _request({"alpha": "factor = rank(x, sample_mask=weight)"})
         )
+
+
+def test_operator_defaults_are_canonicalized_before_validation() -> None:
+    """验证省略默认值与显式默认值共享 Term，且默认窗口参与参数校验。"""
+    engine = BatchFactorEngine(_provider())
+    job = engine.compile(
+        _request(
+            {
+                "implicit": "factor = ts_mean(x)",
+                "explicit": "factor = ts_mean(x, window=5)",
+            }
+        )
+    )
+
+    assert job.plan.outputs["implicit"] == job.plan.outputs["explicit"]
+    with pytest.raises(CompileError, match="min_periods must not exceed window"):
+        engine.compile(_request({"invalid": "factor = ts_mean(x, min_periods=6)"}))
+
+
+def test_where_supports_its_optional_literal_or_dynamic_fallback() -> None:
+    """验证 where 的函数默认值、Literal Term 与动态第三输入均可执行。"""
+    result = BatchFactorEngine(_provider()).compute(
+        _request(
+            {
+                "missing": "factor = where(mask, x)",
+                "literal": "factor = where(mask, x, 0)",
+                "dynamic": "factor = where(mask, x, weight)",
+            }
+        )
+    )
+
+    np.testing.assert_allclose(
+        result.arrays["missing"][0, :, 0], [1.0, np.nan, 3.0], equal_nan=True
+    )
+    np.testing.assert_array_equal(result.arrays["literal"][0, :, 0], [1.0, 0.0, 3.0])
+    np.testing.assert_array_equal(result.arrays["dynamic"][0, :, 0], [1.0, 1.0, 3.0])
+
+
+def test_operator_registry_self_check_rejects_signature_drift() -> None:
+    """验证注册表会拒绝不存在于 kernel 签名中的动态输入。"""
+    validate_operator_registry(default_operator_registry())
+    invalid = OperatorSpec(
+        "invalid",
+        lambda x: x,
+        (ValueKind.NUMERIC,),
+        ValueKind.NUMERIC,
+        optional_inputs=(("sample_mask", ValueKind.MASK),),
+    )
+
+    with pytest.raises(ValueError, match="absent from its function signature"):
+        validate_operator_registry({"invalid": invalid})

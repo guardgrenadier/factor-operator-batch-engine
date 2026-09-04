@@ -1,9 +1,10 @@
 # 文档目录
 
+- 项目全景与 Agent 接手指南：[`PROJECT_OVERVIEW_FOR_AGENTS.md`](PROJECT_OVERVIEW_FOR_AGENTS.md)
 - 正式设计：根目录 [`FACTOR_ENGINE_DESIGN.md`](../FACTOR_ENGINE_DESIGN.md)
 - 数组布局与数据加载边界（Reader/Query Builder/LoadNormalizer 权威设计）：[`数组布局与数据加载边界设计.md`](数组布局与数据加载边界设计.md)（[ADR-0001](adr/0001-use-positional-array-layout-for-operators.md)）
 - 领域术语：根目录 [`CONTEXT.md`](../CONTEXT.md)
-- 当前调用链：[`调用链_最新.md`](调用链_最新.md)
+- 历史详细调用链（部分正文已过期，当前实现先读项目全景）：[`调用链_最新.md`](调用链_最新.md)
 - 调用链设计解读（走读式，含例子）：[`调用链设计解读_walkthrough.md`](调用链设计解读_walkthrough.md)
 - 新增算子与数据源指南（开发 How-to）：[`新增算子与数据源指南.md`](新增算子与数据源指南.md)
 - 指数与行业统计：[`指数与行业统计调用链.md`](指数与行业统计调用链.md)

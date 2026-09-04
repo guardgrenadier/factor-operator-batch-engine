@@ -1,6 +1,7 @@
 # Factor Engine
 
 正式架构和完整契约见 [`FACTOR_ENGINE_DESIGN.md`](FACTOR_ENGINE_DESIGN.md)。
+首次接手项目请先读 [`docs/PROJECT_OVERVIEW_FOR_AGENTS.md`](docs/PROJECT_OVERVIEW_FOR_AGENTS.md)。
 本文件只说明当前推荐入口。
 
 ## 包结构
@@ -165,15 +166,17 @@ close_15m = operator(
 
 ## 数据和 Domain
 
-- `asset_scope={"stk": "all"}` 使用任务开始时 provider 提供的完整有序 master axis；
+- `asset_scope={"stk": "all"}` 当前按“输出区间 + lookback”内存在交易记录的股票
+  代码并集冻结有序轴；这是缺少独立股票 universe 表时的已接受临时语义；
 - 显式子集保留调用方顺序，并拒绝重复或未知代码；
 - Runtime 数组统一为 `float64`，缺失值为 `NaN`，普通 Term shape 为 `T × N × S`；
-- 日频到日内由 Compiler 插入 singleton step broadcast；
+- 日频 singleton step 值可按 NumPy 规则广播到日内 step；
 - 细频率到粗频率必须写 `resample(expr, "1d", method="mean")`；
 - `stk → cb` 写 `project_stk_to_cb(values)`；helper 会自动注册任务级 mapping Source；
 - 指数 Source 由用户显式声明，再用 `select_index_feature(values, index)` 选择单个指数；
 - 指数成员池统计使用 `index_member_stat(values, member, method=...)`；
-- shape 相同但坐标身份不同仍会编译失败。
+- 普通算子只按 shape 和位置计算；相同 shape 的不同坐标身份不会自动失败，业务轴含义
+  由公式和数据产品契约保证。
 
 真实数据任务为每个任务创建一个独立 Provider：
 
@@ -194,9 +197,10 @@ calendar 和资产轴。它不依赖旧 Store、Router、Reader 或 FeatureArray
 
 物理 `SourceSpec` 只在每个分区的 `bind_many()` 阶段产生，不进入 LogicalPlan 语义身份。
 
-## 临时保存闭环
+## 临时保存闭环（生产不可用）
 
-正式 FactorRepository 尚未设计。当前只有验证语义用的临时实现：
+当前项目没有生产落盘需求，也没有可用的生产 FactorRepository。以下临时实现只用于测试
+ResultStream 的提交/失败语义与 `load_factor()` 闭环，不得作为生产存储：
 
 ```python
 from factor_engine import RepositoryDataProvider, TemporaryFactorRepository
@@ -208,7 +212,8 @@ read_provider = RepositoryDataProvider(provider, repository)
 # 之后公式可使用 load_factor("alpha_1")
 ```
 
-保存先写 staging；流自然完成后提交，异常时删除 staging。该目录格式不是未来正式仓库标准。
+保存先写 staging；流自然完成后提交，异常时删除 staging。它不提供生产所需的并发、版本、
+增量更新、恢复或长期格式兼容性。
 
 ## 旧研究层
 

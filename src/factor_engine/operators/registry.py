@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import operator
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from ..domain import ValueKind
 from .alignment import lookup_by_col, select_by_pos
@@ -272,6 +273,53 @@ def _cs_corr_params(params: dict[str, Any]) -> dict[str, Any]:
     return params
 
 
+def validate_operator_registry(registry: Mapping[str, OperatorSpec]) -> None:
+    """校验注册名、函数签名与动态输入声明的最小一致性。"""
+    for name, spec in registry.items():
+        if name != spec.name:
+            raise ValueError(
+                f"Operator registry key {name!r} does not match spec name {spec.name!r}"
+            )
+        if not callable(spec.func):
+            raise TypeError(f"Operator {name!r} func must be callable")
+        parameters = tuple(inspect.signature(spec.func).parameters.values())
+        if isinstance(spec.input_kinds, VariadicInput):
+            if not parameters or parameters[0].kind is not inspect.Parameter.VAR_POSITIONAL:
+                raise ValueError(f"Variadic operator {name!r} must use a *args input")
+            continue
+        if len(parameters) < len(spec.input_kinds):
+            raise ValueError(
+                f"Operator {name!r} declares more inputs than its function signature"
+            )
+        if any(
+            item.default is not inspect.Parameter.empty
+            for item in parameters[: len(spec.input_kinds)]
+        ):
+            raise ValueError(
+                f"Operator {name!r} required dynamic inputs must not have defaults"
+            )
+        required_names = {item.name for item in parameters[: len(spec.input_kinds)]}
+        optional_names: set[str] = set()
+        for input_name, _ in spec.optional_inputs:
+            if input_name in required_names or input_name in optional_names:
+                raise ValueError(
+                    f"Operator {name!r} has duplicate dynamic input {input_name!r}"
+                )
+            optional_names.add(input_name)
+            try:
+                parameter = inspect.signature(spec.func).parameters[input_name]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Operator {name!r} optional input {input_name!r} "
+                    "is absent from its function signature"
+                ) from exc
+            if parameter.default is inspect.Parameter.empty:
+                raise ValueError(
+                    f"Operator {name!r} optional input {input_name!r} "
+                    "must have a default"
+                )
+
+
 def default_operator_registry() -> dict[str, OperatorSpec]:
     """返回 Compiler 和 Runtime 共用的轻量运算符注册表。"""
     # 三种值类型和局部注册 helper 构成后续契约声明的基础。
@@ -294,6 +342,8 @@ def default_operator_registry() -> dict[str, OperatorSpec]:
     ) -> None:
         """向当前注册表加入一项运算符契约。"""
         # 契约完整记录函数、输入输出类型、回看、布局规则和参数校验。
+        if name in registry:
+            raise ValueError(f"Duplicate operator registration {name!r}")
         registry[name] = OperatorSpec(
             name,
             func,
@@ -316,7 +366,7 @@ def default_operator_registry() -> dict[str, OperatorSpec]:
 
     register("step_corr", step_corr, (numeric, numeric), numeric, 0, step_reduce_layout)
 
-    # 一元数值及截面变换保持输入领域。
+    # 一元数值算子保持输入布局，不接收截面样本掩码。
     for name, func in {
         "neg": neg,
         "abs": abs_val,
@@ -325,9 +375,11 @@ def default_operator_registry() -> dict[str, OperatorSpec]:
         "log": log,
         "log10": log10,
         "sqrt": sqrt,
-        "cs_zscore": cs_zscore,
-        "rank": rank,
     }.items():
+        register(name, func, (numeric,))
+
+    # 截面变换可选动态样本掩码。
+    for name, func in {"cs_zscore": cs_zscore, "rank": rank}.items():
         register(name, func, (numeric,), optional_inputs=sample)
 
     register(
@@ -386,7 +438,7 @@ def default_operator_registry() -> dict[str, OperatorSpec]:
     }.items():
         register(name, func, (numeric, numeric), mask)
 
-    register("where", where, (mask, numeric, numeric))
+    register("where", where, (mask, numeric), optional_inputs=(("y", numeric),))
     register("apply_mask", apply_mask, (numeric, mask))
     register("mask_and", mask_and, VariadicInput(mask), mask)
     register("mask_or", mask_or, VariadicInput(mask), mask)
@@ -641,4 +693,5 @@ def default_operator_registry() -> dict[str, OperatorSpec]:
         "rank_mul": rank_mul,
     }.items():
         register(name, func, (numeric, numeric))
+    validate_operator_registry(registry)
     return registry

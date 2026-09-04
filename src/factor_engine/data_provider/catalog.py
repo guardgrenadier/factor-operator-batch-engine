@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from ..domain import ValueKind, get_freq_step_count, parse_feature_key, stable_hash
 from ..formula import SourceRefExpr
@@ -31,8 +31,7 @@ class Catalog:
         """
 
         payload = load_config(config)
-        if int(payload.get("schema_version", 0)) != 3:
-            raise DataProviderError("data_sources.json schema_version must be 3")
+        validate_config(payload)
 
         self.backend = backend
         self.duckdb = duckdb
@@ -173,6 +172,12 @@ class Catalog:
 
         candidates = list(self.sources.get(ref.logical_key, ()))
         params = dict(ref.semantic_params)
+        protected = sorted(set(params) & PHYSICAL_DATASET_PARAMS)
+        if protected:
+            raise DataProviderError(
+                f"Source {ref.logical_key!r} cannot override physical parameters: "
+                f"{protected}"
+            )
         if "data_code" in params:
             candidates = [
                 source
@@ -197,57 +202,12 @@ class Catalog:
     def _add_dataset(self, record: Mapping[str, Any]) -> dict[str, Any]:
         """登记一个物理数据集，校验具名 Reader/Query Builder 并推导坐标列名。"""
 
-        source = str(record["source"])
-        asset = str(record["asset"])
-        frequency = str(record["freq"])
-        table = str(record["table"])
-        # Reader 与 Query Builder 选择必须显式声明，且只存在于数据集配置。
-        reader = record.get("reader")
-        if reader not in READER_NAMES:
-            raise DataProviderError(
-                f"Dataset {table!r} requires a known reader, got {reader!r}"
-            )
-        query_builder = record.get("query_builder")
-        if reader == "sql_reader":
-            if query_builder not in QUERY_BUILDER_NAMES:
-                raise DataProviderError(
-                    f"Dataset {table!r} requires a known query_builder, "
-                    f"got {query_builder!r}"
-                )
-        elif query_builder is not None:
-            raise DataProviderError(
-                f"Dataset {table!r} declares query_builder but reader "
-                f"{reader!r} does not use one"
-            )
-        dataset_id = str(
-            record.get("dataset_id")
-            or stable_hash(source, asset, frequency, table)[:16]
-        )
-        dataset = {
-            "id": dataset_id,
-            "name": record.get("name"),
-            "asset": asset,
-            "frequency": frequency,
-            "source": source,
-            "table": table,
-            "reader": str(reader),
-            "query_builder": (
-                str(query_builder) if query_builder is not None else None
-            ),
-            "date_col": str(
-                record.get("date_col")
-                or ("TradingDay" if source == "IndexQuote" else "DataDate")
-            ),
-            "code_col": str(record.get("code_col") or "InnerCode"),
-            # 代码列中值的物理身份：inner_code（默认）或 secu_code。
-            "code_identity": str(record.get("code_identity", "inner_code")),
-            "trading_flag_col": record.get("trading_flag_col"),
-            "path_template": record.get("path_template"),
-            "data_type": record.get("data_type"),
-            "date_col_type": str(record.get("date_col_type", "date")),
-            "duckdb_threads": int(record.get("duckdb_threads", 8)),
-        }
-        self.datasets.setdefault(dataset_id, dataset)
+        dataset = _dataset_from_record(record, "dataset")
+        existing = self.datasets.get(dataset["id"])
+        if existing is not None:
+            _check_dataset_redeclaration(record, dataset, existing, "dataset")
+            return existing
+        self.datasets[dataset["id"]] = dataset
         return dataset
 
     def _add_source(
@@ -345,6 +305,170 @@ class Catalog:
             )
 
 
+def validate_config(payload: Mapping[str, Any]) -> None:
+    """在任何目录扫描或物理查询前校验最小 Catalog 配置契约。"""
+
+    if not isinstance(payload, Mapping):
+        raise DataProviderError("data_sources config must be an object")
+    if payload.get("schema_version") != 3:
+        raise DataProviderError("data_sources.json schema_version must be 3")
+    records = payload.get("source_tables", ())
+    sources = payload.get("sources", {})
+    if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+        raise DataProviderError("source_tables must be an array")
+    if not isinstance(sources, Mapping):
+        raise DataProviderError("sources must be an object")
+
+    datasets: dict[str, dict[str, Any]] = {}
+    names: set[str] = set()
+    for position, record in enumerate(records):
+        label = f"source_tables[{position}]"
+        dataset = _dataset_from_record(record, label)
+        name = record.get("name")
+        if name is not None:
+            name = str(name).strip()
+            if not name or name in names:
+                raise DataProviderError(f"{label} has an empty or duplicate name")
+            names.add(name)
+        _validate_field_list(record, "fields", label)
+        _validate_field_list(record, "exclude_fields", label)
+        _claim_dataset(record, dataset, datasets, label)
+
+    for logical_key, record in sources.items():
+        label = f"sources[{logical_key!r}]"
+        dataset = _dataset_from_record(record, label)
+        try:
+            key = parse_feature_key(str(logical_key))
+        except ValueError as exc:
+            raise DataProviderError(f"{label} is not an asset.freq.name key") from exc
+        if key.asset != dataset["asset"] or key.freq != dataset["frequency"]:
+            raise DataProviderError(
+                f"{label} asset/freq must match its logical key {key.key!r}"
+            )
+        if record.get("name") is not None and str(record["name"]) != key.name:
+            raise DataProviderError(f"{label} name must match its logical key")
+        if not str(record.get("field", "")).strip():
+            raise DataProviderError(f"{label} requires a non-empty field")
+        try:
+            ValueKind(str(record.get("value_kind", "numeric")).lower())
+        except ValueError as exc:
+            raise DataProviderError(f"{label} has an invalid value_kind") from exc
+        if not isinstance(record.get("params", {}), Mapping):
+            raise DataProviderError(f"{label} params must be an object")
+        _claim_dataset(record, dataset, datasets, label)
+
+
+def _dataset_from_record(record: Mapping[str, Any], label: str) -> dict[str, Any]:
+    """校验并规范化一条数据集声明，不执行外部 I/O。"""
+
+    if not isinstance(record, Mapping):
+        raise DataProviderError(f"{label} must be an object")
+    required = ("asset", "freq", "source", "table", "reader")
+    missing = [name for name in required if not str(record.get(name, "")).strip()]
+    if missing:
+        raise DataProviderError(f"{label} is missing required fields: {missing}")
+    source = str(record["source"])
+    asset = str(record["asset"])
+    frequency = str(record["freq"])
+    table = str(record["table"])
+    try:
+        get_freq_step_count(frequency)
+    except ValueError as exc:
+        raise DataProviderError(f"{label} has unsupported freq {frequency!r}") from exc
+    reader = record["reader"]
+    if reader not in READER_NAMES:
+        raise DataProviderError(f"{label} has unknown reader {reader!r}")
+    query_builder = record.get("query_builder")
+    if reader == "sql_reader" and query_builder not in QUERY_BUILDER_NAMES:
+        raise DataProviderError(f"{label} has unknown query_builder {query_builder!r}")
+    if reader != "sql_reader" and query_builder is not None:
+        raise DataProviderError(
+            f"{label} declares query_builder but reader {reader!r} does not use one"
+        )
+    code_identity = str(record.get("code_identity", "inner_code"))
+    if code_identity not in {"inner_code", "secu_code"}:
+        raise DataProviderError(f"{label} has invalid code_identity {code_identity!r}")
+    if reader in {"parquet_bars", "parquet_panel"} and not record.get(
+        "path_template"
+    ):
+        raise DataProviderError(f"{label} reader {reader!r} requires path_template")
+    try:
+        duckdb_threads = int(record.get("duckdb_threads", 8))
+    except (TypeError, ValueError) as exc:
+        raise DataProviderError(f"{label} duckdb_threads must be positive") from exc
+    if duckdb_threads <= 0:
+        raise DataProviderError(f"{label} duckdb_threads must be positive")
+
+    dataset_id = str(
+        record.get("dataset_id")
+        or stable_hash(source, asset, frequency, table)[:16]
+    )
+    if not dataset_id:
+        raise DataProviderError(f"{label} dataset_id must not be empty")
+    return {
+        "id": dataset_id,
+        "name": record.get("name"),
+        "asset": asset,
+        "frequency": frequency,
+        "source": source,
+        "table": table,
+        "reader": str(reader),
+        "query_builder": str(query_builder) if query_builder is not None else None,
+        "date_col": str(
+            record.get("date_col")
+            or ("TradingDay" if source == "IndexQuote" else "DataDate")
+        ),
+        "code_col": str(record.get("code_col") or "InnerCode"),
+        "code_identity": code_identity,
+        "trading_flag_col": record.get("trading_flag_col"),
+        "path_template": record.get("path_template"),
+        "data_type": record.get("data_type"),
+        "date_col_type": str(record.get("date_col_type", "date")),
+        "duckdb_threads": duckdb_threads,
+    }
+
+
+def _validate_field_list(record: Mapping[str, Any], name: str, label: str) -> None:
+    """校验可选字段清单不是字符串或其他不可预期容器。"""
+
+    value = record.get(name)
+    if value is not None and (
+        not isinstance(value, Sequence) or isinstance(value, (str, bytes))
+    ):
+        raise DataProviderError(f"{label} {name} must be an array")
+
+
+def _claim_dataset(
+    record: Mapping[str, Any],
+    dataset: dict[str, Any],
+    datasets: dict[str, dict[str, Any]],
+    label: str,
+) -> None:
+    """登记配置期数据集身份，并拒绝同 ID 的物理属性冲突。"""
+
+    existing = datasets.get(dataset["id"])
+    if existing is None:
+        datasets[dataset["id"]] = dataset
+        return
+    _check_dataset_redeclaration(record, dataset, existing, label)
+
+
+def _check_dataset_redeclaration(
+    record: Mapping[str, Any],
+    dataset: Mapping[str, Any],
+    existing: Mapping[str, Any],
+    label: str,
+) -> None:
+    """允许省略字段继承已有数据集，但拒绝显式覆盖物理属性。"""
+
+    for record_key, dataset_key in DATASET_RECORD_FIELDS.items():
+        if record_key in record and dataset[dataset_key] != existing[dataset_key]:
+            raise DataProviderError(
+                f"{label} conflicts with dataset_id {dataset['id']!r} "
+                f"on {record_key!r}"
+            )
+
+
 def load_config(config: Mapping[str, Any] | str | Path | None) -> dict[str, Any]:
     """读取 data_sources.json（可传字典、路径或默认内置文件）为配置字典。"""
 
@@ -377,6 +501,37 @@ READER_NAMES = frozenset(
 )
 
 QUERY_BUILDER_NAMES = frozenset({"panel_fields", "adjust_factor", "untradable"})
+
+DATASET_RECORD_FIELDS = {
+    "asset": "asset",
+    "freq": "frequency",
+    "source": "source",
+    "table": "table",
+    "reader": "reader",
+    "query_builder": "query_builder",
+    "date_col": "date_col",
+    "code_col": "code_col",
+    "code_identity": "code_identity",
+    "trading_flag_col": "trading_flag_col",
+    "path_template": "path_template",
+    "data_type": "data_type",
+    "date_col_type": "date_col_type",
+    "duckdb_threads": "duckdb_threads",
+}
+
+PHYSICAL_DATASET_PARAMS = frozenset(
+    {
+        "dataset_id",
+        "date_col",
+        "date_col_type",
+        "code_col",
+        "code_identity",
+        "duckdb_threads",
+        "trading_flag_col",
+        "path_template",
+        "data_type",
+    }
+)
 
 DEFAULT_EXCLUDES = {
     "DataDate",

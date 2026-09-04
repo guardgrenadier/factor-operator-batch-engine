@@ -757,6 +757,8 @@ def _canonical_call(
         raise CompileError(
             f"Invalid arguments for operator {spec.name!r}: {exc}"
         ) from exc
+    provided = set(bound.arguments)
+    bound.apply_defaults()
 
     # 变长输入算子把全部实参直接作为无名数据输入。
     if isinstance(spec.input_kinds, VariadicInput):
@@ -773,6 +775,10 @@ def _canonical_call(
     params: dict[str, Any] = {}
     for name, value in bound.arguments.items():
         if name not in tensor_kinds:
+            # 省略或显式传入的 None 都不进入参数身份；其余函数默认值参与
+            # 校验、lookback 和 CSE，使省略默认值与显式写默认值语义一致。
+            if value is None:
+                continue
             try:
                 params[name] = (
                     _configuration_literal(value) if isinstance(value, Expr) else value
@@ -787,10 +793,10 @@ def _canonical_call(
                     f"Operator {spec.name!r} input {name!r} must be a Term"
                 )
             inputs[name] = value
-        elif not (
+        elif name in provided and not (
             value is None or isinstance(value, LiteralExpr) and value.value is None
         ):
-            if not isinstance(value, Expr) or isinstance(value, LiteralExpr):
+            if not isinstance(value, Expr):
                 raise CompileError(
                     f"Operator {spec.name!r} optional input {name!r} must be a Term or None"
                 )

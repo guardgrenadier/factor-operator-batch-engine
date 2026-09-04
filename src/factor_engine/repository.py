@@ -1,4 +1,4 @@
-"""提供临时已保存因子仓库，并支持将已保存因子作为数据源引用。"""
+"""提供仅供测试的临时因子仓库；该实现不可用于生产。"""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from .model import (
 
 
 class TemporaryFactorRepository:
-    """以最小分块仓库验证因子保存和加载语义。"""
+    """以最小分块仓库验证保存和加载语义，不提供生产存储契约。"""
 
     def __init__(self, root: str | Path) -> None:
         """在指定根目录初始化临时因子仓库。"""
