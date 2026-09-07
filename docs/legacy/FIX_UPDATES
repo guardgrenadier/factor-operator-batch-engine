@@ -1,0 +1,148 @@
+# Formula Pipeline Diagnosis / 公式管线诊断报告
+
+All 20 failing signals grouped by root cause, with fix location and example.
+20 个失败信号按根因分类，附修复位置和示例。
+
+---
+
+## 1. `Fundamental_Item{Code}` constructed field names / 构造型字段名 (6 signals)
+
+`signal_registry.py` passes `"Fundamental_Item1275"` as field. The pipeline stores it in `SourceSpec.field`, then queries `WHERE ItemName = 'Fundamental_Item1275'` — this fails because `ItemName` in `Fundamental_ItemCode` is not stored as this constructed string.
+
+**根因：** 信号定义使用 `"Fundamental_Item1275"`（表名式构造），管线将其当作 `ItemName` 去查 `Fundamental_ItemCode` 表，但该表的 `ItemName` 列不存这种构造字符串，查询结果为空 → `KeyError` → `fundamental_missing`。
+
+| Signal | Fields |
+|---|---|
+| `Signal_Asset_QuartGR` | `Fundamental_Item1275` |
+| `Signal_Debt_Equity` | `Fundamental_Item1278`, `Fundamental_Item1440`, `Fundamental_Item1539` |
+| `Signal_RONACut` | `Fundamental_Item4040`, `Fundamental_Item1539` |
+| `Signal_SalesRevenue_QuartYoY` | `Fundamental_Item2005` |
+| `Signal_StandardOptIncome` | `Fundamental_Item2005` |
+| `Signal_Turnover_CurrentAsset` | `Fundamental_Item2005` |
+
+**Fix location / 修复位置:** `_register_fundamental_source()` in `manager.py:415`
+
+When `field` matches `Fundamental_Item(\d+)`, extract the numeric suffix as `data_code` so the ItemName lookup is bypassed — the table name is already the correct target.
+
+**修复思路：** 字段名本身已包含 ItemCode（如 `Fundamental_Item1275` 中的 `1275`），只需用正则提取出来作为 `data_code` 传入 `source_params`，reader 获得 `data_code` 后跳过 `_resolve_fundamental_data_code` 查询，直接读 `SmartQuant.Fundamental_Item1275` 表。
+
+```python
+# around line 427, after building source_params:
+m = re.fullmatch(r"Fundamental_Item(\d+)", str(field))
+if m:
+    source_params["data_code"] = int(m.group(1))
+```
+
+No signal definition changes needed. 无需修改信号定义。
+
+---
+
+## 2. `BalanceSheet_*` fields routed to wrong source / 资产负债表字段路由错误 (3 signals)
+
+`BalanceSheet_*` fields are registered with `source="Fundamental"`, but BalanceSheet data lives in `Lasted_LC_BalanceSheetAll` (no `EndDateRank`, no `InfoPublDate` — different schema). The `Fundamental_ItemCode` lookup also fails because these aren't entries in that table.
+
+**根因：** `BalanceSheet_*` 字段被当成了 `Fundamental` 数据源处理，但这些字段不是 `Fundamental_ItemCode` 表的条目，数据存在于 `Lasted_LC_BalanceSheetAll` 表（无 `EndDateRank`、`InfoPublDate` 字段，schema 不同）。需要增加一个新的 `BalanceSheet` 数据源分支。
+
+| Signal | Fields |
+|---|---|
+| `Signal_CurrentAsset_TotAsset` | `BalanceSheet_TotalCurrentAssets`, `BalanceSheet_TotalAssets` |
+| `Signal_EarnedReservePerShare` | `BalanceSheet_SurplusReserveFund`, `BalanceSheet_PaidInCapital` |
+| `Signal_Turnover_CurrentAsset` | `BalanceSheet_TotalCurrentAssets_8Q` |
+
+**Fix location / 修复位置:** `smartquant.py:127` (the `if source == "Fundamental"` dispatch)
+
+Add a new `source="BalanceSheet"` route with its own SQL reader. The table `Lasted_LC_BalanceSheetAll` has schema `(DataDate, InnerCode, TotalCurrentAssets, TotalAssets, ...)` — no `EndDateRank`/`InfoPublDate`, so the fundamental step-alignment logic doesn't apply.
+
+**修复思路：** 在 `read_source` 中增加 `source == "BalanceSheet"` 分支，注册时根据字段前缀自动切换数据源。BalanceSheet 不需要分步对齐，直接用 `feature_from_frame` 读出即可。
+
+```python
+# in read_source(), after line 128:
+if source == "BalanceSheet":
+    return self._balance_sheet(spec, store, scope=scope)
+```
+
+With a simpler reader:
+```python
+def _balance_sheet(self, spec, store, *, scope=None):
+    space = store.resolve_space(spec, scope=scope)
+    start, end = date_bounds(space)
+    field = spec.field or spec.name
+    sql = f"""
+        SELECT DataDate, InnerCode, {field} AS value
+        FROM SmartQuant.Lasted_LC_BalanceSheetAll
+        WHERE DataDate BETWEEN '{start}' AND '{end}'
+    """
+    df = self._read_sql(sql)
+    return feature_from_frame(spec, store, df, value_col="value", scope=scope)
+```
+
+And in `_register_fundamental_source`, set `source="BalanceSheet"` when field starts with `BalanceSheet_`:
+
+```python
+if str(field).startswith("BalanceSheet_"):
+    source = "BalanceSheet"
+```
+
+---
+
+## 3. 5min parquet not registered in `source_tables` / 5分钟 parquet 未注册 (3 signals)
+
+| Signal | Missing table |
+|---|---|
+| `HfReturnKurt` | MinuteParquet — 5min frequency |
+| `HfReturnSkew` | MinuteParquet — 5min frequency |
+| `PATV` | MinuteParquet — 5min frequency |
+
+**Fix location / 修复位置:** `core/data_sources.json`
+
+**根因：** `source_tables` 中只有 `1min` 频率的 parquet 配置（第 22-42 行），信号需要 `5min`。需增加 `5min` 条目，指向对应的路径模板和 `sample_date`。
+
+The existing `source_tables` entries only cover `1min` frequency (line 22-42). Add parallel entries for `5min` pointing to the correct path template and `sample_date`.
+
+---
+
+## 4. Mixed-frequency formulas without intermediate / 跨频率公式缺少中间转换 (2 signals)
+
+| Signal | Issue |
+|---|---|
+| `MaxUp` | Joins 1min and 1d without frequency conversion |
+| `Return_last30min` | Joins 1min and 1d without frequency conversion |
+
+**Fix location / 修复位置:** `signal_registry.py`
+
+**根因：** 公式直接 join 了 `1min` 和 `1d` 频率的特征，管线无法自动对齐。需用 `step_last()` 或 `asfreq()` 将 `1min` 中间结果转为 `1d` 后再 join。
+
+Wrap the 1min intermediate with `step_last()` or `asfreq()` before joining with 1d features.
+
+---
+
+## 5. Single-date pipeline produces all-NaN / 单日期管线全 NaN (3 signals)
+
+| Signal | Cause |
+|---|---|
+| `DazzlingVol` | `ts_sum(..., axis=0)` on single date |
+| `RS` | `delay(axis=0)` on single date |
+| `Return_night` | `ts_sum` window=20 on single date |
+
+**Fix / 修复方法:** Use multi-date chunks (e.g., `chunk_size > 1`, `overlap >= window`). Verify before treating as a real bug.
+
+**说明：** 当前测试只跑了单日期，`delay`/`ts_sum` 需要历史数据才能产生有效值。用 `chunk_size > 1`、`overlap >= window` 重新运行即可。确认后才是真正的 bug。
+
+---
+
+## 6. L2 signals — no data source / L2 信号无数据源 (4 signals, expected / 预期)
+
+`HCVOL`, `LCP_deviation`, `LCVOL`, `SemiBeta` — no L2 source in OceanBase. No action.  OceanBase 无 L2 数据，无需处理。
+
+---
+
+## Summary / 汇总
+
+| # | Category / 类别 | Count | Fix Location / 修复位置 | Fix Type / 方案 |
+|---|---|---|---|---|
+| 1 | `Fundamental_Item{Code}` naming / 构造型字段名 | 6 | `manager.py:415` | Extract `data_code` via regex / 正则提取 ItemCode |
+| 2 | `BalanceSheet_*` wrong source / 资产负债表路由错误 | 3 | `smartquant.py` + `manager.py` | New `BalanceSheet` source route / 新增数据源分支 |
+| 3 | 5min parquet not registered / 5分钟 parquet 未注册 | 3 | `data_sources.json` | Add `source_tables` entries / 添加配置项 |
+| 4 | Mixed frequency / 跨频率无中间转换 | 2 | `signal_registry.py` | Add `step_last()` intermediate / 添加频率转换 |
+| 5 | All-NaN on single date / 单日期全 NaN | 3 | (run config) | Multi-date chunks > window / 增加数据天数 |
+| 6 | L2 unavailable / L2 数据不可用 | 4 | — | No action / 无需处理 |

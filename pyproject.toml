@@ -10,6 +10,7 @@ dependencies = [
     "numpy>=2.4.6",
     "pandas>=3.0.3",
     "pyarrow>=25.0.0",
+    "python-dotenv>=1.2.2",
 ]
 
 [build-system]
@@ -21,3 +22,15 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "factor_engine.data_provider" = ["data_sources.json"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "ipywidgets>=8.1.8",
+    "pytest>=9.1.1",
+    "ruff>=0.15.22",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

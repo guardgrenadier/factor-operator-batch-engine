@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -15,7 +15,6 @@ import pandas as pd
 DEFAULT_OB_HOST = "192.168.55.161"
 DEFAULT_OB_PORT = 2883
 DEFAULT_ARROW_BATCH_ROWS = 100_000_000
-RAW_DATA_CONFIG_PATH = Path(__file__).resolve().parents[3] / "rawdata.json"
 
 
 @dataclass(frozen=True)
@@ -26,7 +25,6 @@ class OceanBaseBackend:
     password: str | None = None
     host: str | None = None
     port: int | None = None
-    database: str | None = None
 
     def query(self, sql: str) -> pd.DataFrame:
         """用拼接好的凭据构造连接串并执行 SQL 返回 DataFrame。"""
@@ -34,19 +32,14 @@ class OceanBaseBackend:
         import connectorx
 
         config = _ob_config()
-        user = self.user or config.get("user")
-        password = self.password or config.get("password")
+        user = self.user or config.get("OB_USER")
+        password = self.password or config.get("OB_PASSWORD")
         if not user or not password:
-            raise RuntimeError(
-                "rawdata.json must define oceanbase.user and oceanbase.password"
-            )
-        host = self.host or config.get("host") or DEFAULT_OB_HOST
-        port = int(self.port or config.get("port") or DEFAULT_OB_PORT)
-        database = self.database or config.get("database")
+            raise RuntimeError("OB_USER and OB_PASSWORD are required")
+        host = self.host or config.get("OB_HOST") or DEFAULT_OB_HOST
+        port = int(self.port or config.get("OB_PORT") or DEFAULT_OB_PORT)
         service_user = user if "@service:ocean" in user else f"{user}@service:ocean"
         url = f"mysql://{quote_plus(service_user)}:{quote_plus(password)}@{host}:{port}"
-        if database:
-            url += f"/{quote_plus(str(database))}"
         return connectorx.read_sql(url, sql, return_type="pandas")
 
 
@@ -274,18 +267,17 @@ def measured_arrow(
             close()
 
 
-def _ob_config(path: str | Path | None = None) -> dict[str, Any]:
-    """读取仓库根 rawdata.json 中的 OceanBase 连接配置。"""
+def _ob_config() -> dict[str, Any]:
+    """合并环境变量与仓库根 .env，返回 OceanBase 连接配置字典。"""
 
-    config_path = Path(path) if path is not None else RAW_DATA_CONFIG_PATH
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Cannot read OceanBase config from {config_path}") from exc
-    if not isinstance(config, dict) or not isinstance(config.get("oceanbase"), dict):
-        raise RuntimeError(
-            f"{config_path} must contain an 'oceanbase' JSON object"
-        )
-    return dict(config["oceanbase"])
+        from dotenv import dotenv_values
+    except ImportError:
+        values: Mapping[str, Any] = {}
+    else:
+        repository = Path(__file__).resolve().parents[3]
+        values = dotenv_values(repository / ".env")
+    return {
+        key: os.getenv(key) or values.get(key)
+        for key in ("OB_USER", "OB_PASSWORD", "OB_HOST", "OB_PORT")
+    }
